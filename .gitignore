@@ -1,0 +1,22 @@
+# Python environments and generated files
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Downloaded upstream assets and generated experiment results
+/assets/vendor/
+/runs/
+
+# Local credentials and machine-specific files
+.env
+.env.*
+!.env.example
+.DS_Store
