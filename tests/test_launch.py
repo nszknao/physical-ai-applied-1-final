@@ -1,0 +1,60 @@
+"""Check launcher routing without starting Cocoa or replacing this process."""
+
+import os
+from pathlib import Path
+import sys
+import sysconfig
+import unittest
+from unittest.mock import patch
+
+from duckscout.__main__ import ensure_viewer_process, main
+
+
+class LauncherTests(unittest.TestCase):
+    def test_non_macos_does_not_relaunch(self):
+        with patch.object(sys, "platform", "linux"), patch.object(os, "execve") as execute:
+            ensure_viewer_process([])
+        execute.assert_not_called()
+
+    def test_restarted_process_consumes_marker_without_relaunching(self):
+        with patch.object(sys, "platform", "darwin"):
+            with patch.dict(os.environ, {"_DUCKSCOUT_MJPYTHON_STARTED": "1"}):
+                with patch.object(os, "execve") as execute:
+                    ensure_viewer_process([])
+                self.assertNotIn("_DUCKSCOUT_MJPYTHON_STARTED", os.environ)
+        execute.assert_not_called()
+
+    def test_macos_preserves_interpreter_arguments_and_library_path(self):
+        arguments = ["--scene", "/tmp/a scene.xml", "--keyframe", "SIT"]
+        with patch.dict(os.environ, {"DYLD_FALLBACK_LIBRARY_PATH": "/existing/lib"}):
+            original = os.environ.copy()
+            with patch.object(sys, "platform", "darwin"):
+                with patch.object(Path, "is_file", return_value=True):
+                    with patch.object(os, "execve") as execute:
+                        ensure_viewer_process(arguments)
+            self.assertEqual(dict(os.environ), original)
+        executable, command, environment = execute.call_args.args
+        self.assertEqual(executable, sys.executable)
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(command[2:], ["-m", "duckscout", *arguments])
+        self.assertEqual(environment["_DUCKSCOUT_MJPYTHON_STARTED"], "1")
+        self.assertEqual(
+            environment["DYLD_FALLBACK_LIBRARY_PATH"],
+            sysconfig.get_config_var("LIBDIR") + ":/existing/lib",
+        )
+
+    def test_missing_launcher_reports_setup_error(self):
+        with patch.object(sys, "platform", "darwin"):
+            with patch.object(Path, "is_file", return_value=False):
+                with patch.object(os, "execve") as execute:
+                    with self.assertRaisesRegex(RuntimeError, "mjpython is missing"):
+                        ensure_viewer_process([])
+        execute.assert_not_called()
+
+    def test_headless_entry_does_not_launch_gui(self):
+        with patch("duckscout.__main__.ensure_viewer_process", side_effect=AssertionError("GUI launched")):
+            self.assertEqual(main(["--headless", "--steps", "2"]), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

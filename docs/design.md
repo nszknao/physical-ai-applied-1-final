@@ -10,7 +10,7 @@
 
 Python 3.12とuvを使用する。公式RLプロジェクトがPython `>=3.12,<3.13` を指定しているため、Pythonのバージョンを合わせる。表示・推論に必要な依存に絞り、プロジェクト専用の `.venv/` に隔離する。
 
-物理シミュレーションはMuJoCo、歩行は公式ONNX方策のCPU推論を採用する設計とする。macOSのpassive viewerは `mjpython` で起動する。設定形式はTOMLとする。
+物理シミュレーションはMuJoCo、歩行は公式ONNX方策のCPU推論を採用する設計とする。アプリの起動入口は `python -m duckscout` に統一し、互換用の起動スクリプトは設けない。macOSのGUI実行時に内部で `mjpython` へ切り替える。切り替え済みの判定にはアプリ専用の環境変数を一度だけ読み取って削除し、MuJoCoの非公開APIに依存しない。headless実行では切り替えない。uv管理のPythonでは仮想環境のシンボリックリンクから共有ライブラリを解決できない場合があるため、実行中のPythonが提供するライブラリディレクトリを起動プロセスの探索パスに追加する。設定形式はTOMLとする。
 
 参照：[公式環境定義](https://github.com/pollen-robotics/microduck_rl/blob/develop/pyproject.toml)、[公式推論手順](https://github.com/pollen-robotics/microduck_rl#readme)、[MuJoCo passive viewer](https://mujoco.readthedocs.io/en/stable/python.html#passive-viewer)。実行に使用する上流revisionは固定する。
 
@@ -21,7 +21,7 @@ Python 3.12とuvを使用する。公式RLプロジェクトがPython `>=3.12,<3
 | パス | 用途 | Git管理 |
 |---|---|---|
 | `src/duckscout/` | Pythonパッケージ | 対象 |
-| `assets/sources.toml` | 外部素材の取得元・固定revision・SHA-256 | 対象 |
+| `assets/sources.toml` | 外部素材の取得元・固定revision・Git blobハッシュ | 対象 |
 | `assets/vendor/` | 取得した公式素材。XMLとメッシュの相対配置を保持 | 対象外 |
 | `assets/scenes/` | 独自のシーン | 対象 |
 | `scripts/fetch_assets.py` | 明示的に実行する素材取得処理 | 対象 |
@@ -39,7 +39,7 @@ Python 3.12とuvを使用する。公式RLプロジェクトがPython `>=3.12,<3
 
 | モジュール | 責務 |
 |---|---|
-| `__main__.py` | 起動入口 |
+| `__main__.py` | 引数解析、起動環境の準備 |
 | `simulation.py` | 物理更新、ロボット状態、表示、カメラ画像 |
 | `locomotion.py` | 移動指令とロボット状態を公式方策へ渡し、関節制御へ変換 |
 | `perception.py` | カメラ画像から対象の位置・見え方を推定 |
@@ -63,7 +63,7 @@ Python 3.12とuvを使用する。公式RLプロジェクトがPython `>=3.12,<3
 
 ## 再現性と評価
 
-外部素材は固定revisionで取得し、通常起動で自動更新しない。素材と方策の対応を記録する。出典・ライセンス・改変内容の管理は `THIRD_PARTY_NOTICES.md` に従う。
+外部素材は固定revisionで取得し、通常起動で自動更新しない。取得時は固定コミットのGit blobハッシュとサイズで検証し、取得結果のSHA-256をローカルに記録する。素材と方策の対応を記録する。出典・ライセンス・改変内容の管理は `THIRD_PARTY_NOTICES.md` に従う。
 
 試行ごとに配置、乱数seed、設定、方策revision、コードrevisionを保存する。成功条件は対象の発見と接近後の停止とし、距離・時間・姿勢安定性の閾値を明示する。複数配置について成功率・所要時間・停止距離・失敗理由を比較する。
 

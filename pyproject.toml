@@ -1,10 +1,14 @@
+[build-system]
+requires = ["uv_build==0.8.19"]
+build-backend = "uv_build"
+
 [project]
 name = "duckscout"
 version = "0.1.0"
 description = "A MicroDuck robot that searches for a target, approaches it, and stops."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-dependencies = []
-
-[tool.uv]
-package = false
+dependencies = [
+    "mujoco==3.10.0",
+    "numpy>=2,<3",
+]
