@@ -1,57 +1,209 @@
-"""Load the upstream scene and inspect its untrained physical behavior."""
+"""MuJoCo state, BAM motor control, and paused/headless execution."""
 
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, SimpleQueue
 
 import mujoco
 import mujoco.viewer
 import numpy as np
+from bam.model import Model as BamModel
+from bam.model import load_model
+from bam.mujoco import MujocoController
+
+from duckscout.locomotion import (
+    CONTROL_DECIMATION,
+    DEFAULT_POSE,
+    JOINT_NAMES,
+    PHYSICS_TIMESTEP,
+    StandingPolicy,
+)
+
+# Flat-floor standing checks, measured from the initial trunk position.
+MIN_STANDING_HEIGHT = 0.08
+MAX_STANDING_TILT = 45.0
+MAX_STANDING_DRIFT = 0.10
 
 
-def load_scene(path: Path, keyframe: str):
-    model = mujoco.MjModel.from_xml_path(str(path.resolve()))
-    key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, keyframe)
-    if key_id < 0:
-        raise ValueError(f"Unknown keyframe: {keyframe}")
-    if not np.isfinite(model.opt.timestep) or model.opt.timestep <= 0:
-        raise ValueError("The model must have a positive finite timestep")
-    data = mujoco.MjData(model)
-    mujoco.mj_resetDataKeyframe(model, data, key_id)
-    mujoco.mj_forward(model, data)
-    print(f"Loaded {path.name}: nq={model.nq}, nv={model.nv}, actuators={model.nu}")
-    return model, data, key_id
+def configure_bam(spec: mujoco.MjSpec) -> BamModel:
+    """Configure the scene for XL330 M6 motors and return their BAM model."""
+    # Mirror upstream's CPU rehearsal: voltage motor + M6 friction.
+    bam = load_model(motor_name="xl330", model="m6")
+    bam.actuator.kp = 200.0
+    bam.actuator.vin = 7.4
+    bam.actuator.max_current = None
+    force_limit = 7.4 * bam.kt.value / bam.R.value
+    if tuple(act.name for act in spec.actuators) != JOINT_NAMES:
+        raise ValueError("Scene actuator order does not match velstand")
+    for actuator in spec.actuators:
+        if actuator.target != actuator.name:
+            raise ValueError(f"Unexpected joint target: {actuator.name}")
+        actuator.set_to_motor()
+        actuator.forcelimited = True
+        actuator.forcerange = (-force_limit, force_limit)
+        actuator.ctrllimited = False
+        actuator.gear = [1, 0, 0, 0, 0, 0]
+    for joint in spec.joints:
+        if joint.name in JOINT_NAMES:
+            joint.damping = np.zeros((3, 1))
+            joint.frictionloss = 0.0
+            joint.solref_friction = (-5e4, -2e2)
+            joint.solimp_friction = (0.99, 0.9999, 0.001, 0.5, 2.0)
+    return bam
 
 
-def step(model, data):
-    previous_time = data.time
-    mujoco.mj_step(model, data)
-    if data.time <= previous_time or not all(
-        np.isfinite(values).all() for values in (data.qpos, data.qvel, data.qacc)
-    ):
-        raise RuntimeError("Physics became unstable; stop and reset the simulation")
-    for warning in (
-        mujoco.mjtWarning.mjWARN_BADQPOS,
-        mujoco.mjtWarning.mjWARN_BADQVEL,
-        mujoco.mjtWarning.mjWARN_BADQACC,
-        mujoco.mjtWarning.mjWARN_BADCTRL,
-    ):
-        if data.warning[warning].number:
-            raise RuntimeError(f"MuJoCo reported {warning.name}")
+@dataclass(kw_only=True, eq=False)
+class Simulation:
+    """Own physics and control state; use from_scene() to assemble dependencies."""
+
+    # Injected dependencies. BAM and policy are supplied together for standing.
+    model: mujoco.MjModel
+    data: mujoco.MjData
+    key_id: int
+    bam: BamModel | None = None
+    policy: StandingPolicy | None = None
+
+    # Runtime state, initialized here and restored by reset().
+    motors: MujocoController | None = field(init=False, default=None)
+    step_count: int = field(init=False, default=0)
+    min_height: float = field(init=False, default=float("inf"))
+    max_tilt: float = field(init=False, default=0.0)
+    max_drift: float = field(init=False, default=0.0)
+    start_xy: np.ndarray = field(init=False, default_factory=lambda: np.zeros(2))
+
+    def __post_init__(self) -> None:
+        if (self.bam is None) != (self.policy is None):
+            raise ValueError("BAM and standing policy must be supplied together")
+        self.reset()
+
+    @classmethod
+    def from_scene(
+        cls, path: Path, *, keyframe: str = "STAND", policy_path: Path | None = None
+    ) -> "Simulation":
+        if policy_path is not None and keyframe != "STAND":
+            raise ValueError("Standing policy requires --keyframe STAND")
+        bam = None
+        policy = None
+        spec = mujoco.MjSpec.from_file(str(path.resolve()))
+        if policy_path is not None:
+            bam = configure_bam(spec)
+            spec.option.timestep = PHYSICS_TIMESTEP
+        model = spec.compile()
+        data = mujoco.MjData(model)
+        key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, keyframe)
+        if key_id < 0:
+            raise ValueError(f"Unknown keyframe: {keyframe}")
+        if not np.isfinite(model.opt.timestep) or model.opt.timestep <= 0:
+            raise ValueError("The model must have a positive finite timestep")
+        if policy_path is not None:
+            policy = StandingPolicy.from_onnx(model, policy_path)
+        simulation = cls(model=model, data=data, key_id=key_id, bam=bam, policy=policy)
+        print(f"Loaded {path.name}: nq={model.nq}, nv={model.nv}, actuators={model.nu}")
+        if policy is not None:
+            print(
+                "Standing: CPU policy 50 Hz | BAM XL330 M6 / physics 200 Hz | zero command"
+            )
+
+        return simulation
+
+    def reset(self):
+        if self.policy is not None:
+            # BAM changes model friction as well as MjData; reset both.
+            self.model.dof_damping[self.policy.qvel_indices] = 0
+            self.model.dof_frictionloss[self.policy.qvel_indices] = 0
+        mujoco.mj_resetDataKeyframe(self.model, self.data, self.key_id)
+        if self.policy is not None:
+            self.bam.reset()
+            # Recreate through the public API to clear all controller history.
+            self.motors = MujocoController(
+                self.bam,
+                list(JOINT_NAMES),
+                self.model,
+                self.data,
+                vin_drop_gain=0.1,
+                vin_min=6.0,
+            )
+            root = self.policy.root_qpos
+            self.data.qpos[root : root + 7] = (0, 0, 0.125, 1, 0, 0, 0)
+            self.data.qpos[self.policy.qpos_indices] = DEFAULT_POSE
+            self.data.ctrl[:] = 0
+            self.policy.reset()
+            self.motors.reset(self.data.qpos)
+        mujoco.mj_forward(self.model, self.data)
+        self.step_count = 0
+        self.min_height = float("inf")
+        self.max_tilt = 0.0
+        self.max_drift = 0.0
+        if self.policy is not None:
+            root = self.policy.root_qpos
+            self.start_xy = self.data.qpos[root : root + 2].copy()
+            self.check_standing()
+
+    def step(self):
+        if self.policy is not None:
+            if self.step_count % CONTROL_DECIMATION == 0:
+                self.motors.q_target[:] = self.policy.targets(self.data)
+            self.motors.update()
+        previous_time = self.data.time
+        mujoco.mj_step(self.model, self.data)
+        if self.data.time <= previous_time or not all(
+            np.isfinite(values).all()
+            for values in (self.data.qpos, self.data.qvel, self.data.qacc)
+        ):
+            raise RuntimeError("Physics became unstable; stop and reset the simulation")
+        for warning in (
+            mujoco.mjtWarning.mjWARN_BADQPOS,
+            mujoco.mjtWarning.mjWARN_BADQVEL,
+            mujoco.mjtWarning.mjWARN_BADQACC,
+            mujoco.mjtWarning.mjWARN_BADCTRL,
+        ):
+            if self.data.warning[warning].number:
+                raise RuntimeError(f"MuJoCo reported {warning.name}")
+        self.step_count += 1
+        if self.policy is not None:
+            self.check_standing()
+
+    def check_standing(self):
+        root = self.policy.root_qpos
+        position = self.data.qpos[root : root + 3]
+        w, x, y, z = self.data.qpos[root + 3 : root + 7]
+        tilt = np.degrees(np.arccos(np.clip(1 - 2 * (x * x + y * y), -1, 1)))
+        drift = np.linalg.norm(position[:2] - self.start_xy)
+        self.min_height = min(self.min_height, float(position[2]))
+        self.max_tilt = max(self.max_tilt, float(tilt))
+        self.max_drift = max(self.max_drift, float(drift))
+        if (
+            position[2] < MIN_STANDING_HEIGHT
+            or tilt > MAX_STANDING_TILT
+            or drift > MAX_STANDING_DRIFT
+        ):
+            raise RuntimeError(
+                f"Standing check failed at {self.data.time:.3f}s: "
+                f"height={position[2]:.3f}m, tilt={tilt:.1f}deg, drift={drift:.3f}m"
+            )
 
 
-def run_headless(model, data, steps: int):
+def run_headless(simulation: Simulation, steps: int):
     for _ in range(steps):
-        step(model, data)
-    print(f"Physics OK: {steps} steps, simulation time={data.time:.3f}s")
+        simulation.step()
+    print(f"Physics OK: {steps} steps, simulation time={simulation.data.time:.3f}s")
+    if simulation.policy is not None:
+        print(
+            f"Standing OK: min height={simulation.min_height:.3f}m, "
+            f"max tilt={simulation.max_tilt:.2f}deg, "
+            f"max drift={simulation.max_drift:.4f}m"
+        )
 
 
-def run_viewer(model, data, key_id: int):
+def run_viewer(simulation: Simulation):
     # GUI callbacks only enqueue commands; the main loop owns physics state.
     commands = SimpleQueue()
     paused = True
+    model, data = simulation.model, simulation.data
     print("Paused. Space: run/pause | R: reset and pause | Esc/window close: exit")
-    print("No walking policy is active. The robot may fall when physics runs.")
+    if simulation.policy is None:
+        print("No walking policy is active. The robot may fall when physics runs.")
     with mujoco.viewer.launch_passive(model, data, key_callback=commands.put) as viewer:
         with viewer.lock():
             viewer.cam.lookat[:] = (0, 0, 0.15)
@@ -71,12 +223,11 @@ def run_viewer(model, data, key_id: int):
                         paused = not paused
                         print("Paused" if paused else "Running")
                     elif key == ord("R"):
-                        mujoco.mj_resetDataKeyframe(model, data, key_id)
-                        mujoco.mj_forward(model, data)
+                        simulation.reset()
                         paused = True
                         print("Reset; paused")
                 if not paused:
-                    step(model, data)
+                    simulation.step()
             if started - last_sync >= 1 / 60:
                 viewer.sync()
                 last_sync = started

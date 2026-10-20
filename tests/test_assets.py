@@ -1,5 +1,6 @@
 """Offline checks for corruption, resuming downloads and path containment."""
 
+import hashlib
 import importlib.util
 import tempfile
 import unittest
@@ -40,6 +41,22 @@ class AssetIntegrityTests(unittest.TestCase):
             self.assertEqual(
                 digest, assets.fetch_file(self.source, self.entry, self.root, True)
             )
+
+    def test_sha256_policy_download_and_offline_integrity(self):
+        entry = {
+            "path": "velstand.onnx",
+            "size": len(self.content),
+            "sha256": hashlib.sha256(self.content).hexdigest(),
+        }
+        with patch.object(assets, "urlopen", return_value=BytesIO(self.content)):
+            assets.fetch_file(self.source, entry, self.root, False)
+        with patch.object(
+            assets, "urlopen", side_effect=AssertionError("Network accessed")
+        ):
+            assets.fetch_file(self.source, entry, self.root, True)
+            (self.root / "velstand.onnx").write_bytes(b"wrong\n")
+            with self.assertRaisesRegex(ValueError, "Integrity"):
+                assets.fetch_file(self.source, entry, self.root, True)
 
     def test_corrupt_download_is_not_installed(self):
         with patch.object(assets, "urlopen", return_value=BytesIO(b"wrong\n")):

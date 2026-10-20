@@ -15,6 +15,15 @@
 
 メッシュを共有・改変する際はPollen Roboticsへの帰属表示、出典とライセンスへのリンク、改変の表示、適用ライセンスの条件を保持してください。
 
+## 立位方策と制御仕様
+
+- 方策：[pollen-robotics/microduck-policies](https://huggingface.co/pollen-robotics/microduck-policies)、`velstand.onnx`。
+- 固定revision：`665ae4eb20bfe13bca1ef4ea6d4bb6b4a096e448`。
+- ライセンス：配布元の[モデルカード](https://huggingface.co/pollen-robotics/microduck-policies/blob/665ae4eb20bfe13bca1ef4ea6d4bb6b4a096e448/README.md)でApache-2.0と表示。方策の改変なし。
+- 方策はGit管理せず、`assets/vendor/microduck-policies/` に取得。サイズとSHA-256を `assets/sources.toml` に固定し、取得記録を同ディレクトリの `checksums.json` に保存。
+- 観測順序、基準姿勢、BAM設定はPollen Roboticsの[公式CPU推論コード](https://github.com/pollen-robotics/microduck_rl/blob/b02fdea4902c2b93b7d34a83a6f05da4ececb7d3/scripts/infer_policy.py)（Apache-2.0）を参照・適用。
+- 本プロジェクトでの変更：立位指令に限定し、CLI、互換性検証、一時停止・リセット、立位判定、テストを独自実装。
+
 ## 実行ライブラリ
 
-[MuJoCo](https://github.com/google-deepmind/mujoco)を物理シミュレーションと表示に使用します。Python依存は `pyproject.toml` で宣言します。
+[MuJoCo](https://github.com/google-deepmind/mujoco)を物理シミュレーションと表示に使用します。方策の推論には[ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT）、関節制御には[BAM](https://github.com/Rhoban/bam)（Apache-2.0、Marc Duclusaud & Grégoire Passault）を使用します。BAMは上流の依存ロックに合わせてrevision `62bd8ce12154340be97e06f7f41a0ca8f116d967` に固定します。Python依存は `pyproject.toml` で宣言し、解決結果を `uv.lock` に保存します。

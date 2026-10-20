@@ -212,3 +212,13 @@ size = 641684
 path = "src/mjlab_microduck/robot/microduck/assets/motor_support.stl"
 git_blob_sha1 = "72289542cbb9b02f69686993f59fcf40fbe8422b"
 size = 180884
+
+[policy_source]
+repository = "https://huggingface.co/pollen-robotics/microduck-policies"
+base_url = "https://huggingface.co/pollen-robotics/microduck-policies/resolve"
+revision = "665ae4eb20bfe13bca1ef4ea6d4bb6b4a096e448"
+
+[[policy_files]]
+path = "velstand.onnx"
+size = 793705
+sha256 = "2fc7f8ee6acd7d0d3f66a99927b5d5a56589aeed02ec714de329b252d5ccf492"

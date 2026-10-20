@@ -1,4 +1,4 @@
-"""Fetch the pinned MicroDuck scene, meshes and licenses using only the stdlib."""
+"""Fetch pinned MicroDuck assets and the standing policy using only the stdlib."""
 
 import argparse
 import hashlib
@@ -34,10 +34,13 @@ def asset_path(root: Path, name: str) -> Path:
 
 
 def verify(content: bytes, entry: dict) -> None:
-    if (
-        len(content) != entry["size"]
-        or git_blob_sha1(content) != entry["git_blob_sha1"]
-    ):
+    digest = (
+        hashlib.sha256(content).hexdigest()
+        if "sha256" in entry
+        else git_blob_sha1(content)
+    )
+    expected = entry["sha256"] if "sha256" in entry else entry["git_blob_sha1"]
+    if len(content) != entry["size"] or digest != expected:
         raise ValueError(f"Integrity check failed: {entry['path']}")
 
 
@@ -108,19 +111,30 @@ def main() -> int:
     args = parser.parse_args()
     try:
         manifest = tomllib.loads(MANIFEST.read_text())
-        source = manifest["source"]
-        if not re.fullmatch(r"[0-9a-f]{40}", source["revision"]):
-            raise ValueError("Source revision must be a full Git commit SHA")
-        hashes = {}
-        for entry in manifest["files"]:
-            hashes[entry["path"]] = fetch_file(source, entry, DESTINATION, args.check)
-            print(f"OK {entry['path']}", flush=True)
-        if not args.check:
-            receipt = {"revision": source["revision"], "sha256": hashes}
-            (DESTINATION / "checksums.json").write_text(
-                json.dumps(receipt, indent=2) + "\n"
+        sources = [(manifest["source"], manifest["files"], DESTINATION)]
+        if "policy_source" in manifest:
+            sources.append(
+                (
+                    manifest["policy_source"],
+                    manifest["policy_files"],
+                    ROOT / "assets/vendor/microduck-policies",
+                )
             )
-        print(f"Verified {len(hashes)} files at {source['revision']}")
+        for source, entries, destination in sources:
+            if not re.fullmatch(r"[0-9a-f]{40}", source["revision"]):
+                raise ValueError("Source revision must be a full Git commit SHA")
+            hashes = {}
+            for entry in entries:
+                hashes[entry["path"]] = fetch_file(
+                    source, entry, destination, args.check
+                )
+                print(f"OK {entry['path']}", flush=True)
+            if not args.check:
+                receipt = {"revision": source["revision"], "sha256": hashes}
+                (destination / "checksums.json").write_text(
+                    json.dumps(receipt, indent=2) + "\n"
+                )
+            print(f"Verified {len(hashes)} files at {source['revision']}")
     except (OSError, URLError, ValueError, KeyError) as error:
         print(f"Asset setup failed: {error}", file=sys.stderr)
         return 1

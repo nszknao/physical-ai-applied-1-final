@@ -6,7 +6,7 @@ import sys
 import sysconfig
 from pathlib import Path
 
-from duckscout.simulation import load_scene, run_headless, run_viewer
+from duckscout.simulation import Simulation, run_headless, run_viewer
 
 
 def ensure_viewer_process(arguments: list[str]) -> None:
@@ -49,6 +49,13 @@ def main(arguments: list[str] | None = None) -> int:
     )
     parser.add_argument("--keyframe", default="STAND", help="Initial named pose")
     parser.add_argument(
+        "--policy",
+        type=Path,
+        nargs="?",
+        const=Path("assets/vendor/microduck-policies/velstand.onnx"),
+        help="Enable standing with the downloaded policy, or specify an ONNX path",
+    )
+    parser.add_argument(
         "--headless", action="store_true", help="Check physics without a window"
     )
     parser.add_argument(
@@ -63,15 +70,21 @@ def main(arguments: list[str] | None = None) -> int:
             f"Scene not found: {args.scene}\n"
             "Run from the repository root after: python3.12 scripts/fetch_assets.py"
         )
+    if args.policy is not None and not args.policy.is_file():
+        parser.error(
+            f"Policy not found: {args.policy}\nRun: uv run python scripts/fetch_assets.py"
+        )
     try:
         if not args.headless:
             ensure_viewer_process(arguments)
-        model, data, key_id = load_scene(args.scene, args.keyframe)
+        simulation = Simulation.from_scene(
+            args.scene, keyframe=args.keyframe, policy_path=args.policy
+        )
         if args.headless:
-            run_headless(model, data, args.steps)
+            run_headless(simulation, args.steps)
         else:
-            run_viewer(model, data, key_id)
-    except (ImportError, OSError, ValueError, RuntimeError) as error:
+            run_viewer(simulation)
+    except (ImportError, OSError, KeyError, ValueError, RuntimeError) as error:
         print(f"duckscout: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
