@@ -21,7 +21,7 @@ uv run python scripts/fetch_assets.py
 uv run python -m duckscout
 ```
 
-ロボットと床を一時停止状態で表示します。ウィンドウにフォーカスを合わせて操作してください。
+ロボット・床・正面の赤い対象物を一時停止状態で表示します。ウィンドウにフォーカスを合わせて操作してください。
 
 | 操作 | 動作 |
 |---|---|
@@ -65,6 +65,35 @@ uv run python -m duckscout --policy --headless --steps 6000
 
 胴体の最低高さ・最大傾き・開始位置からの最大水平変位を出力します。方策使用時は物理200 Hz・推論50 Hzで動作し、モデル表示のみのモードとは1ステップの時間が異なります。headless起動では移動指令はゼロです。移動と停止のシナリオは下記の自動テストで実行します。判定条件と学習環境との差は[設計](docs/design.md#移動制御)を参照してください。
 
+## 対象物と頭部カメラ
+
+既定のシーンは `assets/scenes/search.xml` です。初期位置の正面80 cmに、一辺8 cmの赤い立方体を床へ固定しています。配置を変えるにはXMLの `target` の `pos` を編集します。長さの単位はm、`size` は各辺の半分です。物体との衝突は有効です。
+
+頭部視点で起動するには、次を実行してください。
+
+```sh
+uv run python -m duckscout --policy --camera head
+```
+
+起動直後は一時停止しています。Space・矢印キーによる操作は外部視点と同じです。左側の **Rendering → Camera** で `head_camera` と `Tracking`（外部追従視点）を切り替えられます。パネルが隠れている場合はTabで表示します。Trackingは選択中のbodyを追跡し、方策使用時は起動時に胴体を選択します。
+
+**Enter** を押すと、その時点の頭部カメラ画像を `runs/head_camera.ppm` に保存します。表示中の視点に関係なく頭部画像を保存し、同じパスのファイルは上書きします。`--snapshot runs/another.ppm` で保存先を変えられます。PPMはRGBをそのまま保存する画像形式で、追加ライブラリは不要です。macOSでは次のコマンドでPNGへ変換できます。
+
+```sh
+sips -s format png runs/head_camera.ppm --out runs/head_camera.png
+open runs/head_camera.png
+```
+
+RGB画像は320×240で、シミュレーション時間基準で10 Hzで取得します。一時停止中は定期取得も止まり、Enterで現在の画像を取得・保存します。ビューアの更新周期・表示領域の縦横比は保存画像とは異なります。保存画像はビューアのUIや選択マークを含みません。
+
+ウィンドウを開かず、2秒立位後の画像だけ保存する場合：
+
+```sh
+uv run python -m duckscout --policy --headless --steps 400 --snapshot runs/head_camera.ppm
+```
+
+画像保存を指定したheadless実行にはOpenGLの描画環境が必要です。`--snapshot` を付けないheadless実行は描画コンテキストを作りません。
+
 ## 検証
 
 ```sh
@@ -76,6 +105,8 @@ uv run ruff format --check .
 ```
 
 `--check` はネットワークを使わず素材を検証します。`--headless` は物理更新と数値状態を確認します。`--policy` 併用時は高さ・傾きも検証します。表示やキー操作の確認は別途必要です。実方策のテストは素材取得後に実行され、ファイルがない場合はskipと表示されます。立位維持に加え、前進・左右旋回からの停止、旋回後の前進をシミュレーション時間で検証します。
+
+テストファイルはソース単位で対応させています。`test_main.py` は `__main__.py`、`test_locomotion.py` は `locomotion.py`、`test_simulation.py` は `simulation.py`、`test_fetch_assets.py` は `scripts/fetch_assets.py` を対象にします。シミュレーションを通じた移動やカメラの検証も `test_simulation.py` に置き、共通の素材パスとモック方策の準備だけを `tests/helpers.py` にまとめています。
 
 コードのlint・フォーマットには開発用依存のRuffを使用します。整形を適用する場合は `uv run ruff format .` を実行してください。
 

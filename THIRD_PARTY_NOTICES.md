@@ -8,6 +8,7 @@
 - 固定revision：`b02fdea4902c2b93b7d34a83a6f05da4ececb7d3`
 - 利用対象：`scene.xml`、`robot_groundcontact.xml`、これらが参照する38個のSTLメッシュ。
 - 取得時の改変：なし。上流のファイル内容と相対配置を保持。
+- 実行時の変更：頭部カメラの向きをMuJoCoの画像座標系に合わせてメモリ上で補正。独自シーンから固定対象物を追加。BAM使用時にはアクチュエータ・摩擦設定をメモリ上で変更。
 - MJCF（XML）：[Apache-2.0](https://github.com/pollen-robotics/microduck_rl/blob/b02fdea4902c2b93b7d34a83a6f05da4ececb7d3/LICENSE)。
 - STLメッシュ：[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)。範囲・帰属表示の根拠は[上流のライセンス説明](https://github.com/pollen-robotics/microduck_rl/blob/b02fdea4902c2b93b7d34a83a6f05da4ececb7d3/LICENSE-MODELS.md)。
 
@@ -22,7 +23,7 @@
 - ライセンス：配布元の[モデルカード](https://huggingface.co/pollen-robotics/microduck-policies/blob/665ae4eb20bfe13bca1ef4ea6d4bb6b4a096e448/README.md)でApache-2.0と表示。方策の改変なし。
 - 方策はGit管理せず、`assets/vendor/microduck-policies/` に取得。サイズとSHA-256を `assets/sources.toml` に固定し、取得記録を同ディレクトリの `checksums.json` に保存。
 - 観測順序、基準姿勢、BAM設定はPollen Roboticsの[公式CPU推論コード](https://github.com/pollen-robotics/microduck_rl/blob/b02fdea4902c2b93b7d34a83a6f05da4ececb7d3/scripts/infer_policy.py)（Apache-2.0）を参照・適用。
-- 本プロジェクトでの変更：立位指令に限定し、CLI、互換性検証、一時停止・リセット、立位判定、テストを独自実装。
+- 本プロジェクトでの変更：前進・旋回・停止の指令、CLI、互換性検証、一時停止・リセット、姿勢判定、テストを独自実装。
 
 ## 実行ライブラリ
 

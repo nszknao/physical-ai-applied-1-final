@@ -1,4 +1,4 @@
-"""Check launcher routing without starting Cocoa or replacing this process."""
+"""Tests for duckscout.__main__: CLI validation and process launch routing."""
 
 import os
 import sys
@@ -58,6 +58,21 @@ class LauncherTests(unittest.TestCase):
         with patch(
             "duckscout.__main__.ensure_viewer_process",
             side_effect=AssertionError("GUI launched"),
+        ):
+            self.assertEqual(main(["--headless", "--steps", "2"]), 0)
+
+
+class ArgumentTests(unittest.TestCase):
+    def test_rejects_wrong_extension_before_starting_simulation(self):
+        with patch("duckscout.__main__.Simulation.from_scene") as load:
+            with self.assertRaises(SystemExit):
+                main(["--headless", "--snapshot", "frame.png"])
+        load.assert_not_called()
+
+    def test_plain_headless_does_not_create_graphics_context(self):
+        with patch(
+            "duckscout.simulation.mujoco.Renderer",
+            side_effect=AssertionError("Graphics created"),
         ):
             self.assertEqual(main(["--headless", "--steps", "2"]), 0)
 

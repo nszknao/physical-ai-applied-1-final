@@ -89,6 +89,18 @@ BAMは公式CPU推論実装に合わせ、XL330のM6モデル、ファームウ�
 
 参照：[公式CPU推論](https://github.com/pollen-robotics/microduck_rl/blob/b02fdea4902c2b93b7d34a83a6f05da4ececb7d3/scripts/infer_policy.py)、[方策manifest](https://huggingface.co/pollen-robotics/microduck-policies/blob/665ae4eb20bfe13bca1ef4ea6d4bb6b4a096e448/manifest.json)。
 
+## シーンとロボット視点
+
+独自シーン `assets/scenes/search.xml` は固定版の公式シーンをincludeし、赤い対象物を追加する。meshdirは独自シーンから公式メッシュへの相対パスを明示する。対象は一辺0.08 mの立方体で、中心位置は(0.8, 0, 0.04 m)。worldbody直下の固定geomとし、関節を追加せず、ロボットの自由度・方策の関節順序を維持する。対象との衝突は有効とする。
+
+頭部の `jaw_soft` bodyに属する既存の `head_camera` を使用する。固定版の上流カメラ姿勢 `quat="0 0 -1 0"` はMuJoCoのカメラ軸（−Zが前、+Yが上）では後方・横向きになるため、この姿勢の場合に限り読み込み時のMjSpecで `quat=(√0.5, 0, 0, −√0.5)` に補正する。位置と画角は上流定義を維持し、垂直画角は45度。公式ファイルは書き換えず、頭部関節の動きにはそのまま追従する。実機のカメラ校正を再現するものではない。
+
+画像取得には公開APIの `mujoco.Renderer` を使用する。GUI実行中は単一のrendererを保持し、320×240のuint8 RGB画像をシミュレーション時間基準で10 Hzで取得する。物理・方策と同じスレッドで同期処理し、終了時にはコンテキストマネージャーで解放する。画像取得前に `mj_kinematics` と `mj_camlight` で最新姿勢を反映し、物理積分や制約ソルバーの再実行は行わない。壁時計に対する実行速度は描画負荷に依存する。
+
+外部追従視点と頭部視点の切り替えは標準ビューアのカメラ選択を利用する。保存画像は常に頭部視点から取得し、ビューアの視点・選択マークには依存しない。PPM保存は明示的なキー操作またはheadlessの保存オプションで行い、画像ライブラリへの依存は追加しない。headlessでは保存指定時のみ描画コンテキストを作成し、最終状態を1枚取得する。
+
+参照：[MuJoCo Python API](https://mujoco.readthedocs.io/en/3.10.0/python.html)、[カメラ座標系](https://mujoco.readthedocs.io/en/3.10.0/XMLreference.html#body-camera)。
+
 ## 行動判断
 
 - 対象の正解座標を行動判断に渡さず、評価にのみ使用する。

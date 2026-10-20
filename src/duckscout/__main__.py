@@ -44,9 +44,7 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument(
         "--scene",
         type=Path,
-        default=Path(
-            "assets/vendor/microduck_rl/src/mjlab_microduck/robot/microduck/scene.xml"
-        ),
+        default=Path("assets/scenes/search.xml"),
         help="MJCF scene path (relative to the current directory)",
     )
     parser.add_argument("--keyframe", default="STAND", help="Initial named pose")
@@ -63,10 +61,23 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument(
         "--steps", type=int, default=300, help="Number of headless physics steps"
     )
+    parser.add_argument(
+        "--camera",
+        choices=("follow", "head"),
+        default="follow",
+        help="Initial viewer camera (default: follow)",
+    )
+    parser.add_argument(
+        "--snapshot",
+        type=Path,
+        help="PPM destination: Enter saves in the viewer; headless saves the final frame",
+    )
     arguments = sys.argv[1:] if arguments is None else arguments
     args = parser.parse_args(arguments)
     if args.steps < 1:
         parser.error("--steps must be positive")
+    if args.snapshot is not None and args.snapshot.suffix.lower() != ".ppm":
+        parser.error("--snapshot must end in .ppm")
     if not args.scene.is_file():
         parser.error(
             f"Scene not found: {args.scene}\n"
@@ -83,9 +94,13 @@ def main(arguments: list[str] | None = None) -> int:
             args.scene, keyframe=args.keyframe, policy_path=args.policy
         )
         if args.headless:
-            run_headless(simulation, args.steps)
+            run_headless(simulation, args.steps, snapshot=args.snapshot)
         else:
-            run_viewer(simulation)
+            run_viewer(
+                simulation,
+                camera=args.camera,
+                snapshot=args.snapshot or Path("runs/head_camera.ppm"),
+            )
     except (ImportError, OSError, KeyError, ValueError, RuntimeError) as error:
         print(f"duckscout: {error}", file=sys.stderr)
         return 1

@@ -1,6 +1,7 @@
 """MuJoCo state, BAM motor control, and paused/headless execution."""
 
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, SimpleQueue
@@ -25,6 +26,10 @@ from duckscout.locomotion import (
 # Flat-floor posture limits, independent of distance traveled.
 MIN_UPRIGHT_HEIGHT = 0.08
 MAX_UPRIGHT_TILT = 45.0
+CAMERA_NAME = "head_camera"
+CAMERA_WIDTH = 320
+CAMERA_HEIGHT = 240
+CAMERA_PERIOD = 0.1  # Simulation seconds; independent of the viewer refresh rate.
 
 
 def configure_bam(spec: mujoco.MjSpec) -> BamModel:
@@ -87,6 +92,11 @@ class Simulation:
         bam = None
         policy = None
         spec = mujoco.MjSpec.from_file(str(path.resolve()))
+        head_camera = spec.camera(CAMERA_NAME)
+        if head_camera is not None and np.allclose(head_camera.quat, (0, 0, -1, 0)):
+            # The upstream camera looks backward with a sideways image. In the
+            # jaw frame, -Z is forward and +X is up: rotate camera axes -90° on Z.
+            head_camera.quat = (np.sqrt(0.5), 0, 0, -np.sqrt(0.5))
         if policy_path is not None:
             bam = configure_bam(spec)
             spec.option.timestep = PHYSICS_TIMESTEP
@@ -186,7 +196,29 @@ class Simulation:
             )
 
 
-def run_headless(simulation: Simulation, steps: int):
+def render_head_camera(simulation: Simulation, renderer: mujoco.Renderer) -> np.ndarray:
+    """Read RGB at the current pose without advancing physics or the policy."""
+    # mj_step leaves position-derived fields at the previous integration state.
+    # Refresh only poses, avoiding another dynamics/constraint solver evaluation.
+    mujoco.mj_kinematics(simulation.model, simulation.data)
+    mujoco.mj_camlight(simulation.model, simulation.data)
+    renderer.update_scene(simulation.data, camera=CAMERA_NAME)
+    return renderer.render()
+
+
+def save_snapshot(path: Path, rgb: np.ndarray) -> None:
+    """Save lossless RGB as binary PPM without an image-library dependency."""
+    if path.suffix.lower() != ".ppm":
+        raise ValueError("Snapshot path must end in .ppm")
+    height, width, channels = rgb.shape
+    if channels != 3 or rgb.dtype != np.uint8:
+        raise ValueError("Snapshot must be an RGB uint8 image")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(f"P6\n{width} {height}\n255\n".encode("ascii") + rgb.tobytes())
+    print(f"Saved head camera: {path} ({width}x{height} RGB)")
+
+
+def run_headless(simulation: Simulation, steps: int, *, snapshot: Path | None = None):
     for _ in range(steps):
         simulation.step()
     print(f"Physics OK: {steps} steps, simulation time={simulation.data.time:.3f}s")
@@ -196,6 +228,11 @@ def run_headless(simulation: Simulation, steps: int):
             f"max tilt={simulation.max_tilt:.2f}deg, "
             f"max displacement={simulation.max_displacement:.4f}m"
         )
+    if snapshot is not None:
+        with mujoco.Renderer(
+            simulation.model, height=CAMERA_HEIGHT, width=CAMERA_WIDTH
+        ) as renderer:
+            save_snapshot(snapshot, render_head_camera(simulation, renderer))
 
 
 # GLFW arrow key codes supplied by MuJoCo's public key_callback.
@@ -226,18 +263,35 @@ def handle_key(simulation: Simulation, key: int, paused: bool) -> bool:
     return paused
 
 
-def run_viewer(simulation: Simulation):
+def run_viewer(
+    simulation: Simulation,
+    *,
+    camera: str = "follow",
+    snapshot: Path = Path("runs/head_camera.ppm"),
+):
     # GUI callbacks only enqueue commands; the main loop owns physics state.
     commands = SimpleQueue()
     paused = True
     model, data = simulation.model, simulation.data
+    camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, CAMERA_NAME)
+    if camera == "head" and camera_id < 0:
+        raise ValueError(f"Scene has no {CAMERA_NAME} camera")
     print("Paused. Space: run/pause | R: reset and pause | Esc/window close: exit")
     if simulation.policy is None:
         print("No walking policy is active. The robot may fall when physics runs.")
     else:
         print("Up: forward | Left/Right: turn in place | Down: stop and balance")
         print("Commands persist until the next arrow key; Space only pauses time.")
-    with mujoco.viewer.launch_passive(model, data, key_callback=commands.put) as viewer:
+    if camera_id >= 0:
+        print("Rendering > Camera: Tracking/head_camera | Enter: save head-camera PPM")
+    with (
+        (
+            mujoco.Renderer(model, height=CAMERA_HEIGHT, width=CAMERA_WIDTH)
+            if camera_id >= 0
+            else nullcontext()
+        ) as renderer,
+        mujoco.viewer.launch_passive(model, data, key_callback=commands.put) as viewer,
+    ):
         with viewer.lock():
             viewer.cam.lookat[:] = (0, 0, 0.15)
             viewer.cam.distance = 0.8
@@ -246,9 +300,17 @@ def run_viewer(simulation: Simulation):
             if simulation.policy is not None:
                 viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
                 viewer.cam.trackbodyid = simulation.policy.trunk_id
+                # Native Tracking selection uses the selected body.
+                viewer.perturb.select = simulation.policy.trunk_id
+            if camera == "head":
+                viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+                viewer.cam.fixedcamid = camera_id
         last_sync = 0.0
+        next_capture = 0.0
+        rgb = None
         while viewer.is_running():
             started = time.monotonic()
+            save_requested = False
             with viewer.lock():
                 while True:
                     try:
@@ -257,9 +319,20 @@ def run_viewer(simulation: Simulation):
                         break
                     if key == 256:  # Escape
                         return
+                    if key == 257 and renderer is not None:  # Enter
+                        save_requested = True
+                    if key == ord("R"):
+                        next_capture = 0.0
                     paused = handle_key(simulation, key, paused)
                 if not paused:
                     simulation.step()
+                if renderer is not None and (
+                    save_requested or data.time + 1e-9 >= next_capture
+                ):
+                    rgb = render_head_camera(simulation, renderer)
+                    next_capture = data.time + CAMERA_PERIOD
+            if save_requested:
+                save_snapshot(snapshot, rgb)
             if started - last_sync >= 1 / 60:
                 viewer.sync()
                 last_sync = started
