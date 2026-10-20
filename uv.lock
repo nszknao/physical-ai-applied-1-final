@@ -2,6 +2,10 @@ version = 1
 revision = 3
 requires-python = "==3.12.*"
 
+[options]
+exclude-newer = "2026-10-19T01:03:42.988832Z"
+exclude-newer-span = "P1D"
+
 [[package]]
 name = "absl-py"
 version = "2.5.1"
