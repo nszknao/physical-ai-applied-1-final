@@ -1,8 +1,8 @@
 """Load the upstream scene and inspect its untrained physical behavior."""
 
+import time
 from pathlib import Path
 from queue import Empty, SimpleQueue
-import time
 
 import mujoco
 import mujoco.viewer

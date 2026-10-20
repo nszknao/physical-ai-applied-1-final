@@ -2,9 +2,9 @@
 
 import argparse
 import os
-from pathlib import Path
 import sys
 import sysconfig
+from pathlib import Path
 
 from duckscout.simulation import load_scene, run_headless, run_viewer
 
@@ -26,7 +26,9 @@ def ensure_viewer_process(arguments: list[str]) -> None:
     if library_dir and library_name and (Path(library_dir) / library_name).is_file():
         # uv's .venv/bin/python is a symlink; mjpython otherwise searches for
         # @executable_path-relative libpython inside the virtual environment.
-        existing = environment.get("DYLD_FALLBACK_LIBRARY_PATH", "/usr/local/lib:/usr/lib")
+        existing = environment.get(
+            "DYLD_FALLBACK_LIBRARY_PATH", "/usr/local/lib:/usr/lib"
+        )
         environment["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join(
             part for part in (library_dir, existing) if part
         )
@@ -38,13 +40,20 @@ def ensure_viewer_process(arguments: list[str]) -> None:
 def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="MicroDuck model viewer")
     parser.add_argument(
-        "--scene", type=Path,
-        default=Path("assets/vendor/microduck_rl/src/mjlab_microduck/robot/microduck/scene.xml"),
+        "--scene",
+        type=Path,
+        default=Path(
+            "assets/vendor/microduck_rl/src/mjlab_microduck/robot/microduck/scene.xml"
+        ),
         help="MJCF scene path (relative to the current directory)",
     )
     parser.add_argument("--keyframe", default="STAND", help="Initial named pose")
-    parser.add_argument("--headless", action="store_true", help="Check physics without a window")
-    parser.add_argument("--steps", type=int, default=300, help="Number of headless physics steps")
+    parser.add_argument(
+        "--headless", action="store_true", help="Check physics without a window"
+    )
+    parser.add_argument(
+        "--steps", type=int, default=300, help="Number of headless physics steps"
+    )
     arguments = sys.argv[1:] if arguments is None else arguments
     args = parser.parse_args(arguments)
     if args.steps < 1:

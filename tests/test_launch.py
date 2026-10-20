@@ -1,10 +1,10 @@
 """Check launcher routing without starting Cocoa or replacing this process."""
 
 import os
-from pathlib import Path
 import sys
 import sysconfig
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from duckscout.__main__ import ensure_viewer_process, main
@@ -12,7 +12,10 @@ from duckscout.__main__ import ensure_viewer_process, main
 
 class LauncherTests(unittest.TestCase):
     def test_non_macos_does_not_relaunch(self):
-        with patch.object(sys, "platform", "linux"), patch.object(os, "execve") as execute:
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch.object(os, "execve") as execute,
+        ):
             ensure_viewer_process([])
         execute.assert_not_called()
 
@@ -52,7 +55,10 @@ class LauncherTests(unittest.TestCase):
         execute.assert_not_called()
 
     def test_headless_entry_does_not_launch_gui(self):
-        with patch("duckscout.__main__.ensure_viewer_process", side_effect=AssertionError("GUI launched")):
+        with patch(
+            "duckscout.__main__.ensure_viewer_process",
+            side_effect=AssertionError("GUI launched"),
+        ):
             self.assertEqual(main(["--headless", "--steps", "2"]), 0)
 
 

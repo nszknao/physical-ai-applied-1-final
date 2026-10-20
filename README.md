@@ -39,9 +39,13 @@ uv run python -m duckscout
 uv run python scripts/fetch_assets.py --check
 uv run python -m duckscout --headless --steps 300
 uv run python -m unittest discover -s tests -v
+uv run ruff check .
+uv run ruff format --check .
 ```
 
 `--check` はネットワークを使わず素材を検証します。`--headless` は物理更新と数値状態を確認し、表示・歩行の安定性は評価しません。
+
+コードのlint・フォーマットには開発用依存のRuffを使用します。整形を適用する場合は `uv run ruff format .` を実行してください。
 
 ## ドキュメント
 
