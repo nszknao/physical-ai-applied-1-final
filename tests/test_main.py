@@ -63,6 +63,14 @@ class LauncherTests(unittest.TestCase):
 
 
 class ArgumentTests(unittest.TestCase):
+    def test_auto_requires_policy_and_target_coordinates_must_be_finite(self):
+        for arguments in (["--auto"], ["--target", "nan", "0"]):
+            with self.subTest(arguments=arguments):
+                with patch("duckscout.__main__.Simulation.from_scene") as load:
+                    with self.assertRaises(SystemExit):
+                        main(arguments)
+                load.assert_not_called()
+
     def test_rejects_wrong_extension_before_starting_simulation(self):
         with patch("duckscout.__main__.Simulation.from_scene") as load:
             with self.assertRaises(SystemExit):

@@ -14,6 +14,7 @@ from bam.model import Model as BamModel
 from bam.model import load_model
 from bam.mujoco import MujocoController
 
+from duckscout.behavior import Behavior, State
 from duckscout.locomotion import (
     CONTROL_DECIMATION,
     DEFAULT_POSE,
@@ -23,7 +24,7 @@ from duckscout.locomotion import (
     TURN_SPEED,
     LocomotionPolicy,
 )
-from duckscout.perception import annotate_detection, detect_target
+from duckscout.perception import annotate_detection, detect_target, estimate_distance
 
 # Flat-floor posture limits, independent of distance traveled.
 MIN_UPRIGHT_HEIGHT = 0.08
@@ -87,13 +88,25 @@ class Simulation:
 
     @classmethod
     def from_scene(
-        cls, path: Path, *, keyframe: str = "STAND", policy_path: Path | None = None
+        cls,
+        path: Path,
+        *,
+        keyframe: str = "STAND",
+        policy_path: Path | None = None,
+        target_position: tuple[float, float] | None = None,
     ) -> "Simulation":
         if policy_path is not None and keyframe != "STAND":
             raise ValueError("Locomotion policy requires --keyframe STAND")
         bam = None
         policy = None
         spec = mujoco.MjSpec.from_file(str(path.resolve()))
+        if target_position is not None:
+            target = spec.geom("target")
+            if target is None or not np.isfinite(target_position).all():
+                raise ValueError(
+                    "--target requires a named target geom and finite coordinates"
+                )
+            target.pos[:2] = target_position
         head_camera = spec.camera(CAMERA_NAME)
         if head_camera is not None and np.allclose(head_camera.quat, (0, 0, -1, 0)):
             # The upstream camera looks backward with a sideways image. In the
@@ -220,9 +233,67 @@ def save_snapshot(path: Path, rgb: np.ndarray) -> None:
     print(f"Saved head camera: {path} ({width}x{height} RGB)")
 
 
-def run_headless(simulation: Simulation, steps: int, *, snapshot: Path | None = None):
-    for _ in range(steps):
-        simulation.step()
+def make_behavior(simulation: Simulation) -> Behavior:
+    if simulation.policy is None:
+        raise ValueError("--auto requires --policy")
+    if mujoco.mj_name2id(simulation.model, mujoco.mjtObj.mjOBJ_CAMERA, CAMERA_NAME) < 0:
+        raise ValueError(f"--auto requires {CAMERA_NAME}")
+    behavior = Behavior(image_width=CAMERA_WIDTH)
+    behavior.reset(simulation.data.time)
+    return behavior
+
+
+def observe_camera(
+    simulation: Simulation,
+    renderer: mujoco.Renderer,
+    behavior: Behavior | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    rgb = render_head_camera(simulation, renderer)
+    detection = detect_target(rgb)
+    status = None
+    if behavior is not None:
+        distance = estimate_distance(
+            detection,
+            image_width=CAMERA_WIDTH,
+            image_height=CAMERA_HEIGHT,
+            vertical_fov=float(simulation.model.camera(CAMERA_NAME).fovy[0]),
+        )
+        if behavior.state != State.MANUAL:
+            previous = behavior.state
+            forward, yaw = behavior.update(detection, distance, simulation.data.time)
+            simulation.set_command(forward=forward, yaw_rate=yaw)
+            if behavior.state != previous:
+                print(
+                    f"Auto: {behavior.state} ({behavior.reason}) at {simulation.data.time:.1f}s"
+                )
+        distance_label = "--" if distance is None else f"~{distance:.2f}m"
+        status = f"{behavior.state} | {distance_label}\n{behavior.reason}"
+    return rgb, annotate_detection(rgb, detection, status=status)
+
+
+def run_headless(
+    simulation: Simulation,
+    steps: int,
+    *,
+    snapshot: Path | None = None,
+    auto: bool = False,
+):
+    behavior = make_behavior(simulation) if auto else None
+    with (
+        mujoco.Renderer(simulation.model, height=CAMERA_HEIGHT, width=CAMERA_WIDTH)
+        if auto or snapshot is not None
+        else nullcontext()
+    ) as renderer:
+        next_capture = simulation.data.time
+        for _ in range(steps):
+            if auto and simulation.data.time + 1e-9 >= next_capture:
+                observe_camera(simulation, renderer, behavior)
+                next_capture = simulation.data.time + CAMERA_PERIOD
+            simulation.step()
+        if snapshot is not None:
+            rgb, preview = observe_camera(simulation, renderer, behavior)
+            save_snapshot(snapshot, rgb)
+            save_snapshot(snapshot.with_stem(snapshot.stem + "_detection"), preview)
     print(f"Physics OK: {steps} steps, simulation time={simulation.data.time:.3f}s")
     if simulation.policy is not None:
         print(
@@ -230,14 +301,8 @@ def run_headless(simulation: Simulation, steps: int, *, snapshot: Path | None = 
             f"max tilt={simulation.max_tilt:.2f}deg, "
             f"max displacement={simulation.max_displacement:.4f}m"
         )
-    if snapshot is not None:
-        with mujoco.Renderer(
-            simulation.model, height=CAMERA_HEIGHT, width=CAMERA_WIDTH
-        ) as renderer:
-            rgb = render_head_camera(simulation, renderer)
-            preview = annotate_detection(rgb, detect_target(rgb))
-            save_snapshot(snapshot, rgb)
-            save_snapshot(snapshot.with_stem(snapshot.stem + "_detection"), preview)
+    if behavior is not None:
+        print(f"Auto: {behavior.state} ({behavior.reason})")
 
 
 # GLFW arrow key codes supplied by MuJoCo's public key_callback.
@@ -249,16 +314,22 @@ MOTION_KEYS = {
 }
 
 
-def handle_key(simulation: Simulation, key: int, paused: bool) -> bool:
+def handle_key(
+    simulation: Simulation, key: int, paused: bool, behavior: Behavior | None = None
+) -> bool:
     """Apply a queued key on the physics thread and return the pause state."""
     if key == 32:
         paused = not paused
         print("Paused" if paused else "Running")
     elif key == ord("R"):
         simulation.reset()
+        if behavior is not None:
+            behavior.reset(simulation.data.time)
         paused = True
         print("Reset; zero command; paused")
     elif key in MOTION_KEYS and simulation.policy is not None:
+        if behavior is not None:
+            behavior.cancel()
         label, forward, yaw_rate = MOTION_KEYS[key]
         simulation.set_command(forward=forward, yaw_rate=yaw_rate)
         print(
@@ -295,7 +366,9 @@ def run_viewer(
     *,
     camera: str = "follow",
     snapshot: Path = Path("runs/head_camera.ppm"),
+    auto: bool = False,
 ):
+    behavior = make_behavior(simulation) if auto else None
     # GUI callbacks only enqueue commands; the main loop owns physics state.
     commands = SimpleQueue()
     paused = True
@@ -309,6 +382,8 @@ def run_viewer(
     else:
         print("Up: forward | Left/Right: turn in place | Down: stop and balance")
         print("Commands persist until the next arrow key; Space only pauses time.")
+    if auto:
+        print("Auto enabled. Arrow keys: switch to manual | R: reset auto and pause")
     if camera_id >= 0:
         print(
             "Rendering > Camera: Tracking/head_camera | Enter: save raw + detection PPM"
@@ -355,10 +430,10 @@ def run_viewer(
                         return
                     if key == 257 and renderer is not None:  # Enter
                         save_requested = True
-                    if key == ord("R"):
+                    if key == ord("R") or (behavior is not None and key in MOTION_KEYS):
                         next_capture = 0.0
                     was_paused = paused
-                    paused = handle_key(simulation, key, paused)
+                    paused = handle_key(simulation, key, paused, behavior)
                     if paused != was_paused or key == ord("R"):
                         next_step = started
                 if paused:
@@ -376,8 +451,7 @@ def run_viewer(
                 if renderer is not None and (
                     save_requested or data.time + 1e-9 >= next_capture
                 ):
-                    rgb = render_head_camera(simulation, renderer)
-                    preview = annotate_detection(rgb, detect_target(rgb))
+                    rgb, preview = observe_camera(simulation, renderer, behavior)
                     preview_dirty = True
                     next_capture = data.time + CAMERA_PERIOD
             if save_requested:

@@ -63,7 +63,7 @@ uv run python -m duckscout --policy
 uv run python -m duckscout --policy --headless --steps 6000
 ```
 
-胴体の最低高さ・最大傾き・開始位置からの最大水平変位を出力します。方策使用時は物理200 Hz・推論50 Hzで動作し、モデル表示のみのモードとは1ステップの時間が異なります。headless起動では移動指令はゼロです。移動と停止のシナリオは下記の自動テストで実行します。判定条件と学習環境との差は[設計](docs/design.md#移動制御)を参照してください。
+胴体の最低高さ・最大傾き・開始位置からの最大水平変位を出力します。方策使用時は物理200 Hz・推論50 Hzで動作し、モデル表示のみのモードとは1ステップの時間が異なります。`--auto` を付けないheadless起動では移動指令はゼロです。移動と停止のシナリオは下記の自動テストで実行します。判定条件と学習環境との差は[設計](docs/design.md#移動制御)を参照してください。
 
 ## 対象物と頭部カメラ
 
@@ -115,6 +115,47 @@ open runs/head_camera_detection.png
 
 `--snapshot runs/example.ppm` を指定すると元画像と `runs/example_detection.ppm` を保存します。両ファイルは同じフレームから生成され、同名ファイルを上書きします。
 
+## 自動の探索・接近・停止
+
+```sh
+uv run python -m duckscout --policy --auto
+```
+
+起動時は一時停止しています。Spaceで開始すると、1秒間立位を整えてから対象を探します。対象を画像中央へ向けて前進し、推定距離が停止条件に入ると移動指令をゼロにして立位を維持します。右下の画像には現在の状態、推定距離（`~` は概算）、動作理由を表示します。
+
+| 状態 | 動作 |
+|---|---|
+| SEARCH | 対象を探すためにその場旋回。検出が続くか確認するときは停止 |
+| ALIGN | 対象が画像中央に来る方向へその場旋回 |
+| APPROACH | 中央付近の対象へ前進。距離不明・見失い・到着確認中は停止 |
+| ARRIVED | 到着判定後、移動指令ゼロで立位を維持 |
+| TIMED_OUT | シミュレーション時間60秒で到着できなかったため停止 |
+| MANUAL | 自動動作を解除し、矢印キーで操作 |
+
+- **Space**：一時停止・再開。停止中は自動動作のタイマーも進みません。
+- **↓**：自動動作を解除し、移動指令をゼロにします。
+- **↑／←／→**：自動動作を解除し、そのキーの手動指令へ切り替えます。
+- **R**：ロボットと判断状態を初期化し、自動動作を再び有効にして一時停止します。
+- **Enter**：元画像と、状態・推定距離を含む検出結果付き画像を保存します。
+
+見失ったフレームでは前進・旋回を止め、0.5秒戻らなければ探索へ戻ります。到着・時間切れ後は自動で再発進しません。立位方策と物理更新は継続します。
+
+停止条件は、画像からの**推定距離40 cm以下**です。対象の高さ8 cmと画像の見かけの高さを使う概算で、実距離40 cmを保証しません。立方体の向き・頭の傾き・画像の切れによって誤差があり、対象が画像端で欠けた場合は距離不明として前進を止めます。
+
+`--target X Y` でその実行だけ対象の配置を変えられます。単位はmで、初期ロボットの正面が+X、左が+Yです。例えば左前方に置く場合：
+
+```sh
+uv run python -m duckscout --policy --auto --target 0.4 0.7
+```
+
+右前方は `--target 0.4 -0.7`、背後は `--target -0.8 0` です。配置はシーン設定にのみ使い、自動判断には渡しません。`--camera head` も併用できます。
+
+ウィンドウなしで自動動作を実行する場合は次を使います。毎回カメラ画像を取得するため、OpenGLの描画環境が必要です。最後に出力する状態で到着・時間切れ・途中終了を区別してください。
+
+```sh
+uv run python -m duckscout --policy --auto --headless --steps 12600 --snapshot runs/auto.ppm
+```
+
 ## 検証
 
 ```sh
@@ -127,7 +168,7 @@ uv run ruff format --check .
 
 `--check` はネットワークを使わず素材を検証します。`--headless` は物理更新と数値状態を確認します。`--policy` 併用時は高さ・傾きも検証します。表示やキー操作の確認は別途必要です。実方策のテストは素材取得後に実行され、ファイルがない場合はskipと表示されます。立位維持に加え、前進・左右旋回からの停止、旋回後の前進をシミュレーション時間で検証します。
 
-テストファイルはソース単位で対応させています。`test_main.py` は `__main__.py`、`test_locomotion.py` は `locomotion.py`、`test_perception.py` は `perception.py`、`test_simulation.py` は `simulation.py`、`test_fetch_assets.py` は `scripts/fetch_assets.py` を対象にします。シミュレーションを通じた移動やカメラの検証も `test_simulation.py` に置き、共通の素材パスとモック方策の準備だけを `tests/helpers.py` にまとめています。
+テストファイルはソース単位で対応させています。`test_main.py` は `__main__.py`、`test_locomotion.py` は `locomotion.py`、`test_perception.py` は `perception.py`、`test_behavior.py` は `behavior.py`、`test_simulation.py` は `simulation.py`、`test_fetch_assets.py` は `scripts/fetch_assets.py` を対象にします。シミュレーションを通じた移動やカメラの検証も `test_simulation.py` に置き、共通の素材パス・モック方策・テスト用の投影画像生成を `tests/helpers.py` にまとめています。
 
 コードのlint・フォーマットには開発用依存のRuffを使用します。整形を適用する場合は `uv run ruff format .` を実行してください。
 

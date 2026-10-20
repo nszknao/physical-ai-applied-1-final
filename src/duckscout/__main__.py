@@ -1,6 +1,7 @@
 """Command-line entry point for the MicroDuck viewer."""
 
 import argparse
+import math
 import os
 import sys
 import sysconfig
@@ -47,6 +48,18 @@ def main(arguments: list[str] | None = None) -> int:
         default=Path("assets/scenes/search.xml"),
         help="MJCF scene path (relative to the current directory)",
     )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Search, approach and stop using head-camera detections (requires --policy)",
+    )
+    parser.add_argument(
+        "--target",
+        nargs=2,
+        type=float,
+        metavar=("X", "Y"),
+        help="Override target placement in metres for this run",
+    )
     parser.add_argument("--keyframe", default="STAND", help="Initial named pose")
     parser.add_argument(
         "--policy",
@@ -74,6 +87,10 @@ def main(arguments: list[str] | None = None) -> int:
     )
     arguments = sys.argv[1:] if arguments is None else arguments
     args = parser.parse_args(arguments)
+    if args.auto and args.policy is None:
+        parser.error("--auto requires --policy")
+    if args.target is not None and not all(math.isfinite(v) for v in args.target):
+        parser.error("--target coordinates must be finite")
     if args.steps < 1:
         parser.error("--steps must be positive")
     if args.snapshot is not None and args.snapshot.suffix.lower() != ".ppm":
@@ -91,15 +108,19 @@ def main(arguments: list[str] | None = None) -> int:
         if not args.headless:
             ensure_viewer_process(arguments)
         simulation = Simulation.from_scene(
-            args.scene, keyframe=args.keyframe, policy_path=args.policy
+            args.scene,
+            keyframe=args.keyframe,
+            policy_path=args.policy,
+            target_position=tuple(args.target) if args.target is not None else None,
         )
         if args.headless:
-            run_headless(simulation, args.steps, snapshot=args.snapshot)
+            run_headless(simulation, args.steps, snapshot=args.snapshot, auto=args.auto)
         else:
             run_viewer(
                 simulation,
                 camera=args.camera,
                 snapshot=args.snapshot or Path("runs/head_camera.ppm"),
+                auto=args.auto,
             )
     except (ImportError, OSError, KeyError, ValueError, RuntimeError) as error:
         print(f"duckscout: {error}", file=sys.stderr)

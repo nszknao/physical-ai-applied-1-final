@@ -5,7 +5,12 @@ import unittest
 import cv2
 import numpy as np
 
-from duckscout.perception import annotate_detection, detect_target
+from duckscout.perception import (
+    Detection,
+    annotate_detection,
+    detect_target,
+    estimate_distance,
+)
 
 
 class DetectionTests(unittest.TestCase):
@@ -83,6 +88,37 @@ class DetectionTests(unittest.TestCase):
             with self.subTest(shape=image.shape, dtype=image.dtype):
                 with self.assertRaisesRegex(ValueError, "RGB"):
                     detect_target(image)
+
+
+class DistanceTests(unittest.TestCase):
+    def test_known_height_pinhole_range_and_inverse_size_relationship(self):
+        args = dict(image_width=320, image_height=240, vertical_fov=45)
+        target = Detection(bbox=(100, 80, 40, 40), center=(120, 100), area=1600)
+        distance = estimate_distance(target, **args)
+        self.assertAlmostEqual(
+            distance, 240 / (2 * np.tan(np.radians(22.5))) * 0.08 / 40
+        )
+        larger = Detection(bbox=(80, 40, 80, 80), center=(120, 80), area=6400)
+        self.assertAlmostEqual(estimate_distance(larger, **args), distance / 2)
+
+    def test_missing_and_edge_clipped_targets_have_no_distance(self):
+        args = dict(image_width=320, image_height=240, vertical_fov=45)
+        self.assertIsNone(estimate_distance(None, **args))
+        for box in (
+            (0, 80, 20, 20),
+            (300, 80, 20, 20),
+            (100, 0, 20, 20),
+            (100, 220, 20, 20),
+        ):
+            detection = Detection(bbox=box, center=(100, 100), area=400)
+            self.assertIsNone(estimate_distance(detection, **args))
+
+    def test_invalid_calibration_is_rejected(self):
+        for fov in (0, 180, float("nan")):
+            with self.assertRaises(ValueError):
+                estimate_distance(
+                    None, image_width=320, image_height=240, vertical_fov=fov
+                )
 
 
 class AnnotationTests(unittest.TestCase):

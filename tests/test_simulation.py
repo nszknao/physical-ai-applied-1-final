@@ -9,8 +9,9 @@ from unittest.mock import Mock, patch
 
 import mujoco
 import numpy as np
-from helpers import POLICY, SCENE, fake_session, make_simulation
+from helpers import POLICY, SCENE, ProjectedCubeRenderer, fake_session, make_simulation
 
+from duckscout.behavior import State
 from duckscout.locomotion import (
     DEFAULT_POSE,
     FORWARD_SPEED,
@@ -22,6 +23,8 @@ from duckscout.simulation import (
     CAMERA_WIDTH,
     Simulation,
     handle_key,
+    make_behavior,
+    observe_camera,
     render_head_camera,
     run_headless,
     run_viewer,
@@ -533,6 +536,97 @@ class CameraGeometryTests(unittest.TestCase):
             self.sim.policy.last_action, control.policy.last_action
         )
         self.assertEqual(self.sim.data.time, control.data.time)
+
+
+@unittest.skipUnless(
+    SCENE.is_file() and POLICY.is_file(), "Fetch model and policy first"
+)
+class AutomaticSimulationTests(unittest.TestCase):
+    def test_real_policy_reaches_and_holds_stop_with_projected_rgb(self):
+        # This fixture replaces only GPU rendering. Shading/occlusion need real-image checks.
+        for label, position in (
+            ("front", (0.8, 0)),
+            ("left", (0.4, 0.7)),
+            ("right", (0.4, -0.7)),
+            ("behind", (-0.8, 0)),
+        ):
+            with self.subTest(position=label):
+                sim = Simulation.from_scene(
+                    SEARCH_SCENE, policy_path=POLICY, target_position=position
+                )
+                np.testing.assert_allclose(sim.model.geom("target").pos[:2], position)
+                behavior = make_behavior(sim)
+                renderer = ProjectedCubeRenderer(sim.model)
+                arrived_at = None
+                for step in range(10000):
+                    if step % 20 == 0:
+                        observe_camera(sim, renderer, behavior)
+                        if behavior.state == State.ARRIVED and arrived_at is None:
+                            arrived_at = sim.data.time
+                    sim.step()
+                    if arrived_at is not None and sim.data.time - arrived_at >= 3:
+                        break
+                self.assertEqual(behavior.state, State.ARRIVED)
+                self.assertGreaterEqual(sim.data.time - arrived_at, 3)
+                np.testing.assert_array_equal(sim.policy.command, np.zeros(13))
+                observe_camera(sim, renderer, behavior)
+                # Ground truth is used only in this assertion, never in Behavior.
+                distance = np.linalg.norm(
+                    sim.data.geom("target").xpos - sim.data.cam("head_camera").xpos
+                )
+                self.assertGreater(distance, 0.25)
+                self.assertLess(distance, 0.65)
+                self.assertLess(np.linalg.norm(sim.data.qvel[:2]), 0.02)
+                print(
+                    f"Projected RGB {label}: arrival={arrived_at:.1f}s, true range={distance:.3f}m"
+                )
+
+    def test_no_target_times_out_and_keeps_standing(self):
+        sim = Simulation.from_scene(SEARCH_SCENE, policy_path=POLICY)
+        behavior = make_behavior(sim)
+        renderer = ProjectedCubeRenderer(sim.model, visible=False)
+        for step in range(12601):
+            if step % 20 == 0:
+                observe_camera(sim, renderer, behavior)
+            sim.step()
+        self.assertEqual(behavior.state, State.TIMED_OUT)
+        np.testing.assert_array_equal(sim.policy.command, np.zeros(13))
+        self.assertLess(np.linalg.norm(sim.data.qvel[:2]), 0.02)
+
+    def test_manual_override_is_not_overwritten_by_observation_and_reset_rearms(self):
+        sim = Simulation.from_scene(SEARCH_SCENE, policy_path=POLICY)
+        behavior = make_behavior(sim)
+        renderer = ProjectedCubeRenderer(sim.model)
+        sim.set_command(forward=FORWARD_SPEED)
+        self.assertFalse(handle_key(sim, 264, False, behavior))
+        self.assertEqual(behavior.state, State.MANUAL)
+        np.testing.assert_array_equal(sim.policy.command, np.zeros(13))
+        handle_key(sim, 265, False, behavior)
+        observe_camera(sim, renderer, behavior)
+        self.assertAlmostEqual(sim.policy.command[0], FORWARD_SPEED)
+        self.assertTrue(handle_key(sim, ord("R"), False, behavior))
+        self.assertEqual(behavior.state, State.SEARCH)
+        self.assertEqual(sim.data.time, 0)
+        np.testing.assert_array_equal(sim.policy.command, np.zeros(13))
+        self.assertFalse(handle_key(sim, 32, True, behavior))
+        self.assertEqual(behavior.state, State.SEARCH)
+
+    def test_headless_auto_updates_from_rgb_and_applies_commands(self):
+        sim = Simulation.from_scene(SEARCH_SCENE, policy_path=POLICY)
+        renderer = ProjectedCubeRenderer(sim.model)
+        behavior = make_behavior(sim)
+        with (
+            patch("duckscout.simulation.mujoco.Renderer") as factory,
+            patch("duckscout.simulation.make_behavior", return_value=behavior),
+        ):
+            factory.return_value.__enter__.return_value = renderer
+            run_headless(sim, 2000, auto=True)
+        self.assertEqual(behavior.state, State.ARRIVED)
+        np.testing.assert_array_equal(sim.policy.command, np.zeros(13))
+
+    def test_auto_requires_locomotion_and_named_camera(self):
+        with self.assertRaisesRegex(ValueError, "policy"):
+            make_behavior(Simulation.from_scene(SEARCH_SCENE))
 
 
 class CameraPreviewTests(unittest.TestCase):

@@ -1,9 +1,11 @@
 """Shared robot assets and fake ONNX setup; contains no test cases."""
 
+from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import cv2
 import mujoco
 import numpy as np
 
@@ -51,3 +53,38 @@ def make_simulation(session):
         bam=bam,
         policy=policy,
     )
+
+
+class ProjectedCubeRenderer:
+    """Test double: projects target geometry into RGB; does not emulate shading/occlusion."""
+
+    def __init__(self, model, visible=True):
+        self.model = model
+        self.visible = visible
+
+    def update_scene(self, data, camera):
+        self.data = data
+        self.camera = self.model.camera(camera).id
+
+    def render(self):
+        image = np.zeros((240, 320, 3), np.uint8)
+        if not self.visible:
+            return image
+        m, d, c = self.model, self.data, self.camera
+        target = m.geom("target").id
+        corners = np.array(list(product((-1, 1), repeat=3))) * m.geom_size[target]
+        world = corners @ d.geom_xmat[target].reshape(3, 3).T + d.geom_xpos[target]
+        local = (world - d.cam_xpos[c]) @ d.cam_xmat[c].reshape(3, 3)
+        if np.any(local[:, 2] >= -0.005):
+            return image
+        f = 120 / np.tan(np.radians(m.cam_fovy[c]) / 2)
+        pixels = np.stack(
+            (
+                160 + f * local[:, 0] / -local[:, 2],
+                120 - f * local[:, 1] / -local[:, 2],
+            ),
+            axis=1,
+        )
+        hull = cv2.convexHull(np.round(pixels).astype(np.int32))
+        cv2.fillConvexPoly(image, hull, (255, 0, 0))
+        return image

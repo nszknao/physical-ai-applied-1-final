@@ -45,7 +45,46 @@ def detect_target(rgb: np.ndarray) -> Detection | None:
     )
 
 
-def annotate_detection(rgb: np.ndarray, detection: Detection | None) -> np.ndarray:
+def estimate_distance(
+    detection: Detection | None,
+    *,
+    image_width: int,
+    image_height: int,
+    vertical_fov: float,
+    target_height: float = 0.08,
+) -> float | None:
+    """Approximate optical-axis range from known height; reject clipped boxes."""
+    if (
+        image_width <= 0
+        or image_height <= 0
+        or not np.isfinite(vertical_fov)
+        or not 0 < vertical_fov < 180
+        or not np.isfinite(target_height)
+        or target_height <= 0
+    ):
+        raise ValueError("Invalid camera geometry or target height")
+    if detection is None:
+        return None
+    x, y, width, height = detection.bbox
+    if (
+        width <= 0
+        or height <= 0
+        or x <= 1
+        or y <= 1
+        or x + width >= image_width - 1
+        or y + height >= image_height - 1
+    ):
+        return None
+    focal = image_height / (2 * np.tan(np.radians(vertical_fov) / 2))
+    return float(focal * target_height / height)
+
+
+def annotate_detection(
+    rgb: np.ndarray,
+    detection: Detection | None,
+    *,
+    status: str | None = None,
+) -> np.ndarray:
     """Draw diagnostic marks on a copy, keeping the recognition input untouched."""
     image = rgb.copy()
     if detection is None:
@@ -70,4 +109,19 @@ def annotate_detection(rgb: np.ndarray, detection: Detection | None) -> np.ndarr
             thickness,
             cv2.LINE_AA,
         )
+    if status is not None:
+        lines = status.splitlines()
+        for index, line in enumerate(lines):
+            origin = (6, image.shape[0] - 10 - 16 * (len(lines) - 1 - index))
+            for color, thickness in (((0, 0, 0), 3), ((255, 255, 255), 1)):
+                cv2.putText(
+                    image,
+                    line,
+                    origin,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.38,
+                    color,
+                    thickness,
+                    cv2.LINE_AA,
+                )
     return image
