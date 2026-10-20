@@ -28,3 +28,5 @@
 ## 実行ライブラリ
 
 [MuJoCo](https://github.com/google-deepmind/mujoco)を物理シミュレーションと表示に使用します。方策の推論には[ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT）、関節制御には[BAM](https://github.com/Rhoban/bam)（Apache-2.0、Marc Duclusaud & Grégoire Passault）を使用します。BAMは上流の依存ロックに合わせてrevision `62bd8ce12154340be97e06f7f41a0ca8f116d967` に固定します。Python依存は `pyproject.toml` で宣言し、解決結果を `uv.lock` に保存します。
+
+対象検出の色変換・連結領域抽出と検出結果の描画には [OpenCV](https://opencv.org/) の `opencv-python-headless` を使用します。検出のしきい値・領域選択・表示への接続は本プロジェクトで実装しています。

@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=2,<3",
     "onnxruntime>=1.24.4,<2",
     "better-actuator-models[mujoco]",
+    "opencv-python-headless>=4.10,<5",
 ]
 
 [dependency-groups]

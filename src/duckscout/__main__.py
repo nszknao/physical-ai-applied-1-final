@@ -70,7 +70,7 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument(
         "--snapshot",
         type=Path,
-        help="PPM destination: Enter saves in the viewer; headless saves the final frame",
+        help="Raw PPM destination; also saves a _detection.ppm image (Enter or final headless frame)",
     )
     arguments = sys.argv[1:] if arguments is None else arguments
     args = parser.parse_args(arguments)

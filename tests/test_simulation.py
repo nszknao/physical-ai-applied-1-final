@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 from contextlib import nullcontext
+from itertools import count
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -22,8 +23,10 @@ from duckscout.simulation import (
     Simulation,
     handle_key,
     render_head_camera,
+    run_headless,
     run_viewer,
     save_snapshot,
+    show_camera_preview,
 )
 
 SEARCH_SCENE = Path(__file__).resolve().parents[1] / "assets/scenes/search.xml"
@@ -327,7 +330,9 @@ class CameraGeometryTests(unittest.TestCase):
             ("follow", mujoco.mjtCamera.mjCAMERA_TRACKING),
         ):
             with self.subTest(camera=camera):
-                backend = Mock(exitrequest=0)
+                backend = Mock(
+                    exitrequest=0, viewport=mujoco.MjrRect(100, 20, 800, 600)
+                )
                 backend.lock.return_value = nullcontext()
                 backend.sync.side_effect = lambda _: setattr(backend, "exitrequest", 1)
                 # Real Handle properties catch unsupported attribute names. Only
@@ -347,6 +352,9 @@ class CameraGeometryTests(unittest.TestCase):
                     patch("duckscout.simulation.mujoco.Renderer") as renderer,
                     patch("duckscout.simulation.time.sleep"),
                 ):
+                    renderer.return_value.__enter__.return_value.render.return_value = (
+                        np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+                    )
                     run_viewer(self.sim, camera=camera)
                 self.assertEqual(viewer.cam.type, expected_type)
                 self.assertEqual(viewer.cam.trackbodyid, self.sim.policy.trunk_id)
@@ -355,9 +363,160 @@ class CameraGeometryTests(unittest.TestCase):
                     self.assertEqual(
                         viewer.cam.fixedcamid, self.sim.model.camera(CAMERA_NAME).id
                     )
+                backend.set_images.assert_called_once()
                 backend.sync.assert_called_once()
                 backend.exit.assert_called_once()
                 renderer.return_value.__exit__.assert_called_once()
+
+    def test_viewer_replaces_overlay_when_target_is_lost_and_reacquired(self):
+        frames = [np.zeros((240, 320, 3), dtype=np.uint8) for _ in range(3)]
+        frames[0][80:100, 40:60] = (255, 0, 0)
+        frames[2][80:100, 200:220] = (255, 0, 0)
+        backend = Mock(exitrequest=0, viewport=mujoco.MjrRect(0, 0, 976, 600))
+        backend.lock.return_value = nullcontext()
+        viewer = mujoco.viewer.Handle(
+            backend, mujoco.MjvCamera(), mujoco.MjvOption(), mujoco.MjvPerturb(), None
+        )
+        callbacks = []
+
+        def launch(*args, key_callback):
+            callbacks.append(key_callback)
+            return viewer
+
+        def sync(_):
+            if backend.sync.call_count < 3:
+                callbacks[0](257)  # Capture a fresh image even while paused.
+            else:
+                backend.exitrequest = 1
+
+        backend.sync.side_effect = sync
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch(
+                    "duckscout.simulation.mujoco.viewer.launch_passive",
+                    side_effect=launch,
+                ),
+                patch("duckscout.simulation.mujoco.Renderer") as renderer,
+                patch("duckscout.simulation.time.sleep"),
+                patch(
+                    "duckscout.simulation.time.monotonic", side_effect=count(1, 0.02)
+                ),
+            ):
+                renderer.return_value.__enter__.return_value.render.side_effect = frames
+                run_viewer(self.sim, snapshot=Path(directory) / "head.ppm")
+        self.assertEqual(backend.set_images.call_count, 3)
+        for index, expected_x in enumerate((40, None, 200)):
+            # The real Handle flips images for OpenGL; restore top-left origin.
+            preview = np.flip(
+                backend.set_images.call_args_list[index].args[0][0][1], axis=0
+            )
+            green = np.all(preview == (0, 255, 0), axis=2)
+            ys, xs = np.nonzero(green)
+            if expected_x is None:
+                self.assertEqual(len(xs), 0)
+            else:
+                self.assertEqual(int(xs.min()), expected_x)
+                self.assertEqual(int(ys.min()), 80)
+        self.assertEqual(self.sim.data.time, 0)
+
+    def test_render_delays_do_not_slow_fixed_step_physics(self):
+        clock = [0.0]
+        image = np.zeros((240, 320, 3), dtype=np.uint8)
+        backend = Mock(exitrequest=0, viewport=mujoco.MjrRect(0, 0, 976, 600))
+        backend.lock.return_value = nullcontext()
+        viewer = mujoco.viewer.Handle(
+            backend, mujoco.MjvCamera(), mujoco.MjvOption(), mujoco.MjvPerturb(), None
+        )
+
+        def advance(seconds):
+            clock[0] += seconds
+            if clock[0] > 3:
+                self.fail("Viewer failed to keep up with the simulated clock")
+
+        def render():
+            advance(0.03)  # GPU readback takes 30 ms, longer than a 5 ms step.
+            return image
+
+        def launch(*args, key_callback):
+            key_callback(32)  # Start physics immediately.
+            return viewer
+
+        def sync(_):
+            advance(0.001)
+            if self.sim.data.time >= 1.0:
+                backend.exitrequest = 1
+
+        backend.sync.side_effect = sync
+        backend.set_images.side_effect = lambda _: advance(0.03)
+        with (
+            patch(
+                "duckscout.simulation.mujoco.viewer.launch_passive", side_effect=launch
+            ),
+            patch("duckscout.simulation.mujoco.Renderer") as renderer,
+            patch("duckscout.simulation.time.monotonic", side_effect=lambda: clock[0]),
+            patch("duckscout.simulation.time.sleep", side_effect=advance),
+        ):
+            renderer.return_value.__enter__.return_value.render.side_effect = render
+            run_viewer(self.sim)
+        self.assertGreaterEqual(self.sim.data.time, 1.0)
+        self.assertLess(clock[0], 1.15)
+        self.assertLess(abs(clock[0] - self.sim.data.time), 0.1)
+        self.assertAlmostEqual(self.sim.data.time, self.sim.step_count * 0.005)
+        self.assertLessEqual(backend.set_images.call_count, 12)
+        self.assertGreater(backend.sync.call_count, backend.set_images.call_count)
+
+    def test_paused_preview_is_uploaded_only_once_and_again_on_resize(self):
+        clock = [0.0]
+        backend = Mock(exitrequest=0, viewport=mujoco.MjrRect(0, 0, 800, 600))
+        backend.lock.return_value = nullcontext()
+        viewer = mujoco.viewer.Handle(
+            backend, mujoco.MjvCamera(), mujoco.MjvOption(), mujoco.MjvPerturb(), None
+        )
+
+        def sync(_):
+            if backend.sync.call_count == 3:
+                backend.viewport = mujoco.MjrRect(0, 0, 1000, 600)
+            if backend.sync.call_count == 5:
+                backend.exitrequest = 1
+
+        backend.sync.side_effect = sync
+        with (
+            patch(
+                "duckscout.simulation.mujoco.viewer.launch_passive", return_value=viewer
+            ),
+            patch("duckscout.simulation.mujoco.Renderer") as renderer,
+            patch("duckscout.simulation.time.monotonic", side_effect=lambda: clock[0]),
+            patch(
+                "duckscout.simulation.time.sleep",
+                side_effect=lambda seconds: clock.__setitem__(
+                    0, clock[0] + max(seconds, 0.001)
+                ),
+            ),
+        ):
+            renderer.return_value.__enter__.return_value.render.return_value = np.zeros(
+                (240, 320, 3), dtype=np.uint8
+            )
+            run_viewer(self.sim)
+        renderer.return_value.__enter__.return_value.render.assert_called_once()
+        self.assertEqual(backend.set_images.call_count, 2)
+        self.assertEqual(self.sim.data.time, 0)
+
+    def test_headless_saves_raw_and_annotated_images_separately(self):
+        image = np.zeros((240, 320, 3), dtype=np.uint8)
+        image[80:100, 100:120] = (255, 0, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "camera.ppm"
+            with patch("duckscout.simulation.mujoco.Renderer") as renderer:
+                renderer.return_value.__enter__.return_value.render.return_value = image
+                run_headless(self.sim, 2, snapshot=path)
+            raw = path.read_bytes().split(b"\n", 3)[3]
+            annotated = (
+                path.with_stem("camera_detection").read_bytes().split(b"\n", 3)[3]
+            )
+            self.assertEqual(raw, image.tobytes())
+            self.assertNotEqual(annotated, raw)
+            pixels = np.frombuffer(annotated, dtype=np.uint8).reshape(image.shape)
+            np.testing.assert_array_equal(pixels[80, 100], (0, 255, 0))
 
     def test_sampling_camera_does_not_change_control_trajectory(self):
         control = Simulation.from_scene(SEARCH_SCENE, policy_path=POLICY)
@@ -374,6 +533,42 @@ class CameraGeometryTests(unittest.TestCase):
             self.sim.policy.last_action, control.policy.last_action
         )
         self.assertEqual(self.sim.data.time, control.data.time)
+
+
+class CameraPreviewTests(unittest.TestCase):
+    def test_overlay_fits_viewport_and_real_handle_flips_rgb_once(self):
+        for width, height in ((800, 600), (200, 80), (2400, 1800)):
+            with self.subTest(width=width, height=height):
+                backend = Mock(viewport=mujoco.MjrRect(100, 40, width, height))
+                viewer = mujoco.viewer.Handle(
+                    backend,
+                    mujoco.MjvCamera(),
+                    mujoco.MjvOption(),
+                    mujoco.MjvPerturb(),
+                    None,
+                )
+                image = np.zeros((240, 320, 3), dtype=np.uint8)
+                image[:120] = (255, 0, 0)
+                image[120:] = (0, 0, 255)
+                show_camera_preview(viewer, image)
+                rect, pixels = backend.set_images.call_args.args[0][0]
+                self.assertEqual(pixels.shape, (rect.height, rect.width, 3))
+                self.assertGreaterEqual(rect.left, 100)
+                self.assertGreaterEqual(rect.bottom, 40)
+                self.assertLessEqual(rect.left + rect.width, 100 + width)
+                self.assertLessEqual(rect.bottom + rect.height, 40 + height)
+                np.testing.assert_array_equal(pixels[0, 0], (0, 0, 255))
+                np.testing.assert_array_equal(pixels[-1, 0], (255, 0, 0))
+                self.assertTrue(pixels.flags.c_contiguous)
+
+    def test_minimized_viewport_clears_the_overlay(self):
+        backend = Mock(viewport=mujoco.MjrRect(0, 0, 0, 0))
+        viewer = mujoco.viewer.Handle(
+            backend, mujoco.MjvCamera(), mujoco.MjvOption(), mujoco.MjvPerturb(), None
+        )
+        show_camera_preview(viewer, np.zeros((240, 320, 3), dtype=np.uint8))
+        backend.clear_images.assert_called_once()
+        backend.set_images.assert_not_called()
 
 
 class SnapshotTests(unittest.TestCase):

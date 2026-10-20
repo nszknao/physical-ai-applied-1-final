@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, SimpleQueue
 
+import cv2
 import mujoco
 import mujoco.viewer
 import numpy as np
@@ -22,6 +23,7 @@ from duckscout.locomotion import (
     TURN_SPEED,
     LocomotionPolicy,
 )
+from duckscout.perception import annotate_detection, detect_target
 
 # Flat-floor posture limits, independent of distance traveled.
 MIN_UPRIGHT_HEIGHT = 0.08
@@ -232,7 +234,10 @@ def run_headless(simulation: Simulation, steps: int, *, snapshot: Path | None = 
         with mujoco.Renderer(
             simulation.model, height=CAMERA_HEIGHT, width=CAMERA_WIDTH
         ) as renderer:
-            save_snapshot(snapshot, render_head_camera(simulation, renderer))
+            rgb = render_head_camera(simulation, renderer)
+            preview = annotate_detection(rgb, detect_target(rgb))
+            save_snapshot(snapshot, rgb)
+            save_snapshot(snapshot.with_stem(snapshot.stem + "_detection"), preview)
 
 
 # GLFW arrow key codes supplied by MuJoCo's public key_callback.
@@ -263,6 +268,28 @@ def handle_key(simulation: Simulation, key: int, paused: bool) -> bool:
     return paused
 
 
+def show_camera_preview(viewer: mujoco.viewer.Handle, image: np.ndarray) -> None:
+    """Overlay the annotated head image inside the current 3D viewport."""
+    viewport = viewer.viewport
+    if viewport is None or viewport.width <= 16 or viewport.height <= 16:
+        viewer.clear_images()
+        return
+    height, width = image.shape[:2]
+    scale = min(
+        2.0, (viewport.width - 16) / (3 * width), (viewport.height - 16) / height
+    )
+    size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    preview = cv2.resize(image, size, interpolation=cv2.INTER_NEAREST)
+    rect = mujoco.MjrRect(
+        viewport.left + viewport.width - size[0] - 8,
+        viewport.bottom + 8,
+        size[0],
+        size[1],
+    )
+    # set_images handles the RGB-to-OpenGL vertical flip. Call outside viewer.lock().
+    viewer.set_images((rect, preview))
+
+
 def run_viewer(
     simulation: Simulation,
     *,
@@ -283,7 +310,10 @@ def run_viewer(
         print("Up: forward | Left/Right: turn in place | Down: stop and balance")
         print("Commands persist until the next arrow key; Space only pauses time.")
     if camera_id >= 0:
-        print("Rendering > Camera: Tracking/head_camera | Enter: save head-camera PPM")
+        print(
+            "Rendering > Camera: Tracking/head_camera | Enter: save raw + detection PPM"
+        )
+        print("Bottom-right: head camera, green target box and yellow center (10 Hz)")
     with (
         (
             mujoco.Renderer(model, height=CAMERA_HEIGHT, width=CAMERA_WIDTH)
@@ -306,8 +336,12 @@ def run_viewer(
                 viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
                 viewer.cam.fixedcamid = camera_id
         last_sync = 0.0
+        next_step = time.monotonic()
+        preview_dirty = False
+        last_viewport = None
         next_capture = 0.0
         rgb = None
+        preview = None
         while viewer.is_running():
             started = time.monotonic()
             save_requested = False
@@ -323,18 +357,46 @@ def run_viewer(
                         save_requested = True
                     if key == ord("R"):
                         next_capture = 0.0
+                    was_paused = paused
                     paused = handle_key(simulation, key, paused)
-                if not paused:
-                    simulation.step()
+                    if paused != was_paused or key == ord("R"):
+                        next_step = started
+                if paused:
+                    next_step = started
+                else:
+                    # Keep fixed physics steps, but recover time spent rendering.
+                    # Bound catch-up after a long stall so input stays responsive.
+                    for _ in range(20):
+                        if next_step > started + 1e-9:
+                            break
+                        simulation.step()
+                        next_step += model.opt.timestep
+                    if next_step <= started:
+                        next_step = started + model.opt.timestep
                 if renderer is not None and (
                     save_requested or data.time + 1e-9 >= next_capture
                 ):
                     rgb = render_head_camera(simulation, renderer)
+                    preview = annotate_detection(rgb, detect_target(rgb))
+                    preview_dirty = True
                     next_capture = data.time + CAMERA_PERIOD
             if save_requested:
                 save_snapshot(snapshot, rgb)
+                save_snapshot(snapshot.with_stem(snapshot.stem + "_detection"), preview)
             if started - last_sync >= 1 / 60:
                 viewer.sync()
+                viewport = viewer.viewport
+                viewport_size = (
+                    (viewport.left, viewport.bottom, viewport.width, viewport.height)
+                    if viewport is not None
+                    else None
+                )
+                if preview is not None and (
+                    preview_dirty or viewport_size != last_viewport
+                ):
+                    show_camera_preview(viewer, preview)
+                    preview_dirty = False
+                    last_viewport = viewport_size
                 last_sync = started
-            period = 1 / 60 if paused else model.opt.timestep
-            time.sleep(max(0, period - (time.monotonic() - started)))
+            wake_at = started + 1 / 60 if paused else next_step
+            time.sleep(max(0, wake_at - time.monotonic()))

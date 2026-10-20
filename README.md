@@ -77,22 +77,43 @@ uv run python -m duckscout --policy --camera head
 
 起動直後は一時停止しています。Space・矢印キーによる操作は外部視点と同じです。左側の **Rendering → Camera** で `head_camera` と `Tracking`（外部追従視点）を切り替えられます。パネルが隠れている場合はTabで表示します。Trackingは選択中のbodyを追跡し、方策使用時は起動時に胴体を選択します。
 
-**Enter** を押すと、その時点の頭部カメラ画像を `runs/head_camera.ppm` に保存します。表示中の視点に関係なく頭部画像を保存し、同じパスのファイルは上書きします。`--snapshot runs/another.ppm` で保存先を変えられます。PPMはRGBをそのまま保存する画像形式で、追加ライブラリは不要です。macOSでは次のコマンドでPNGへ変換できます。
+**Enter** を押すと、その時点の頭部カメラ画像を `runs/head_camera.ppm`、検出結果付き画像を `runs/head_camera_detection.ppm` に保存します。表示中の視点に関係なく頭部画像を保存し、同じパスのファイルは上書きします。`--snapshot runs/another.ppm` で保存先を変えられます。PPMはRGBをそのまま保存する画像形式で、追加ライブラリは不要です。macOSでは次のコマンドでPNGへ変換できます。
 
 ```sh
 sips -s format png runs/head_camera.ppm --out runs/head_camera.png
 open runs/head_camera.png
 ```
 
-RGB画像は320×240で、シミュレーション時間基準で10 Hzで取得します。一時停止中は定期取得も止まり、Enterで現在の画像を取得・保存します。ビューアの更新周期・表示領域の縦横比は保存画像とは異なります。保存画像はビューアのUIや選択マークを含みません。
+RGB画像は320×240で、シミュレーション時間基準で10 Hzで取得します。一時停止中は定期取得も止まり、Enterで現在の画像を取得・保存します。ビューアの更新周期・表示領域の縦横比は保存画像とは異なります。元画像はビューアのUI・選択マーク・検出枠を含みません。
 
-ウィンドウを開かず、2秒立位後の画像だけ保存する場合：
+ウィンドウを開かず、2秒立位後の元画像と検出結果付き画像を保存する場合：
 
 ```sh
 uv run python -m duckscout --policy --headless --steps 400 --snapshot runs/head_camera.ppm
 ```
 
 画像保存を指定したheadless実行にはOpenGLの描画環境が必要です。`--snapshot` を付けないheadless実行は描画コンテキストを作りません。
+
+## 対象検出
+
+```sh
+uv run python -m duckscout --policy
+```
+
+右下に頭部カメラ画像を表示し、赤い対象候補を**緑の枠**、その中心を**黄色の十字**で示します。上部の `x`・`y` は画像左上を原点とする中心座標、`area` は検出した赤い画素の数です。検出できない場合は枠が消えて `Target: not detected` と表示します。外部視点・頭部視点のどちらを選んでも、この小窓は頭部の画像を表示します。小窓への画像転送は画像更新時とウィンドウサイズ変更時に行います。小窓はウィンドウに合わせて拡縮しますが、認識には常に320×240の元画像を使います。
+
+画像取得と同じ10 Hzで毎回検出します。一時停止中は最後の結果を表示し、リセットとEnterで画像・検出結果を更新します。Spaceで開始し、←／→で対象を視野外へ出してから戻すと、見失い・再検出を確認できます。動きを止めるには↓を使ってください。
+
+検出結果は表示・保存に使用し、移動は矢印キーで操作します。色に基づく検出なので、赤い別物体を区別することや、暗さ・照明変化への完全な対応はできません。
+
+Enterで保存した検出結果付き画像は、macOSでは次で開けます。
+
+```sh
+sips -s format png runs/head_camera_detection.ppm --out runs/head_camera_detection.png
+open runs/head_camera_detection.png
+```
+
+`--snapshot runs/example.ppm` を指定すると元画像と `runs/example_detection.ppm` を保存します。両ファイルは同じフレームから生成され、同名ファイルを上書きします。
 
 ## 検証
 
@@ -106,7 +127,7 @@ uv run ruff format --check .
 
 `--check` はネットワークを使わず素材を検証します。`--headless` は物理更新と数値状態を確認します。`--policy` 併用時は高さ・傾きも検証します。表示やキー操作の確認は別途必要です。実方策のテストは素材取得後に実行され、ファイルがない場合はskipと表示されます。立位維持に加え、前進・左右旋回からの停止、旋回後の前進をシミュレーション時間で検証します。
 
-テストファイルはソース単位で対応させています。`test_main.py` は `__main__.py`、`test_locomotion.py` は `locomotion.py`、`test_simulation.py` は `simulation.py`、`test_fetch_assets.py` は `scripts/fetch_assets.py` を対象にします。シミュレーションを通じた移動やカメラの検証も `test_simulation.py` に置き、共通の素材パスとモック方策の準備だけを `tests/helpers.py` にまとめています。
+テストファイルはソース単位で対応させています。`test_main.py` は `__main__.py`、`test_locomotion.py` は `locomotion.py`、`test_perception.py` は `perception.py`、`test_simulation.py` は `simulation.py`、`test_fetch_assets.py` は `scripts/fetch_assets.py` を対象にします。シミュレーションを通じた移動やカメラの検証も `test_simulation.py` に置き、共通の素材パスとモック方策の準備だけを `tests/helpers.py` にまとめています。
 
 コードのlint・フォーマットには開発用依存のRuffを使用します。整形を適用する場合は `uv run ruff format .` を実行してください。
 
