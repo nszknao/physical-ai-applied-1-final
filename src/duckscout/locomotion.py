@@ -51,11 +51,13 @@ COMMAND_SIZE = 3 + 4 + 6  # twist, head pose, body pose
 OBSERVATION_SIZE = 3 + 3 + 3 * JOINT_COUNT + COMMAND_SIZE
 CONTROL_DECIMATION = 4
 PHYSICS_TIMESTEP = 0.005
+FORWARD_SPEED = 0.30  # m/s, also the maximum accepted forward command
+TURN_SPEED = 0.80  # rad/s, also the maximum accepted absolute yaw command
 
 
 @dataclass(kw_only=True, eq=False)
-class StandingPolicy:
-    """Validate dependencies and translate robot state into standing targets."""
+class LocomotionPolicy:
+    """Validate dependencies and translate robot state into locomotion targets."""
 
     # Injected dependencies. from_onnx() loads a CPU session for normal use.
     model: mujoco.MjModel
@@ -73,6 +75,10 @@ class StandingPolicy:
     # Per-instance history, cleared on reset.
     last_action: np.ndarray = field(
         init=False, default_factory=lambda: np.zeros(JOINT_COUNT, dtype=np.float32)
+    )
+
+    command: np.ndarray = field(
+        init=False, default_factory=lambda: np.zeros(COMMAND_SIZE, dtype=np.float32)
     )
 
     def __post_init__(self) -> None:
@@ -134,12 +140,12 @@ class StandingPolicy:
             if metadata.get(name) != expected:
                 raise ValueError(f"Incompatible policy metadata: {name}")
         if float(metadata.get("action_scale", "nan")) != 1.0:
-            raise ValueError("Standing policy requires action_scale = 1.0")
+            raise ValueError("Locomotion policy requires action_scale = 1.0")
         self.input_name = inputs[0].name
         self.output_name = outputs[0].name
 
     @classmethod
-    def from_onnx(cls, model: mujoco.MjModel, path: Path) -> "StandingPolicy":
+    def from_onnx(cls, model: mujoco.MjModel, path: Path) -> "LocomotionPolicy":
         options = ort.SessionOptions()
         options.intra_op_num_threads = 1
         options.inter_op_num_threads = 1
@@ -151,8 +157,22 @@ class StandingPolicy:
             raise RuntimeError(f"Cannot load ONNX policy {path}: {error}") from error
         return cls(model=model, session=session)
 
+    def set_command(self, *, forward: float = 0.0, yaw_rate: float = 0.0) -> None:
+        """Set body-frame forward speed [m/s] and yaw rate [rad/s]."""
+        if not np.isfinite([forward, yaw_rate]).all():
+            raise ValueError("Velocity commands must be finite")
+        if not 0 <= forward <= FORWARD_SPEED or abs(yaw_rate) > TURN_SPEED:
+            raise ValueError(
+                f"Commands require forward in [0, {FORWARD_SPEED}] m/s "
+                f"and yaw_rate in [-{TURN_SPEED}, {TURN_SPEED}] rad/s"
+            )
+        self.command.fill(0)
+        self.command[0] = forward
+        self.command[2] = yaw_rate
+
     def reset(self) -> None:
         self.last_action.fill(0)
+        self.command.fill(0)
 
     def observation(self, data: mujoco.MjData) -> np.ndarray:
         # xmat maps body to world; its last row negated is gravity in body axes.
@@ -164,7 +184,7 @@ class StandingPolicy:
                 data.qpos[self.qpos_indices] - DEFAULT_POSE,
                 data.qvel[self.qvel_indices],
                 self.last_action,
-                np.zeros(COMMAND_SIZE),  # All-zero commands request standing.
+                self.command,  # twist(3), head(4), body(6); zero means stand.
             )
         ).astype(np.float32)
         if not np.isfinite(observation).all():

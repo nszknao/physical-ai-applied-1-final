@@ -15,15 +15,16 @@ from bam.mujoco import MujocoController
 from duckscout.locomotion import (
     CONTROL_DECIMATION,
     DEFAULT_POSE,
+    FORWARD_SPEED,
     JOINT_NAMES,
     PHYSICS_TIMESTEP,
-    StandingPolicy,
+    TURN_SPEED,
+    LocomotionPolicy,
 )
 
-# Flat-floor standing checks, measured from the initial trunk position.
-MIN_STANDING_HEIGHT = 0.08
-MAX_STANDING_TILT = 45.0
-MAX_STANDING_DRIFT = 0.10
+# Flat-floor posture limits, independent of distance traveled.
+MIN_UPRIGHT_HEIGHT = 0.08
+MAX_UPRIGHT_TILT = 45.0
 
 
 def configure_bam(spec: mujoco.MjSpec) -> BamModel:
@@ -57,24 +58,24 @@ def configure_bam(spec: mujoco.MjSpec) -> BamModel:
 class Simulation:
     """Own physics and control state; use from_scene() to assemble dependencies."""
 
-    # Injected dependencies. BAM and policy are supplied together for standing.
+    # Injected dependencies. BAM and policy are supplied together for locomotion.
     model: mujoco.MjModel
     data: mujoco.MjData
     key_id: int
     bam: BamModel | None = None
-    policy: StandingPolicy | None = None
+    policy: LocomotionPolicy | None = None
 
     # Runtime state, initialized here and restored by reset().
     motors: MujocoController | None = field(init=False, default=None)
     step_count: int = field(init=False, default=0)
     min_height: float = field(init=False, default=float("inf"))
     max_tilt: float = field(init=False, default=0.0)
-    max_drift: float = field(init=False, default=0.0)
+    max_displacement: float = field(init=False, default=0.0)
     start_xy: np.ndarray = field(init=False, default_factory=lambda: np.zeros(2))
 
     def __post_init__(self) -> None:
         if (self.bam is None) != (self.policy is None):
-            raise ValueError("BAM and standing policy must be supplied together")
+            raise ValueError("BAM and locomotion policy must be supplied together")
         self.reset()
 
     @classmethod
@@ -82,7 +83,7 @@ class Simulation:
         cls, path: Path, *, keyframe: str = "STAND", policy_path: Path | None = None
     ) -> "Simulation":
         if policy_path is not None and keyframe != "STAND":
-            raise ValueError("Standing policy requires --keyframe STAND")
+            raise ValueError("Locomotion policy requires --keyframe STAND")
         bam = None
         policy = None
         spec = mujoco.MjSpec.from_file(str(path.resolve()))
@@ -97,12 +98,12 @@ class Simulation:
         if not np.isfinite(model.opt.timestep) or model.opt.timestep <= 0:
             raise ValueError("The model must have a positive finite timestep")
         if policy_path is not None:
-            policy = StandingPolicy.from_onnx(model, policy_path)
+            policy = LocomotionPolicy.from_onnx(model, policy_path)
         simulation = cls(model=model, data=data, key_id=key_id, bam=bam, policy=policy)
         print(f"Loaded {path.name}: nq={model.nq}, nv={model.nv}, actuators={model.nu}")
         if policy is not None:
             print(
-                "Standing: CPU policy 50 Hz | BAM XL330 M6 / physics 200 Hz | zero command"
+                "Locomotion: CPU policy 50 Hz | BAM XL330 M6 / physics 200 Hz | zero command"
             )
 
         return simulation
@@ -134,11 +135,16 @@ class Simulation:
         self.step_count = 0
         self.min_height = float("inf")
         self.max_tilt = 0.0
-        self.max_drift = 0.0
+        self.max_displacement = 0.0
         if self.policy is not None:
             root = self.policy.root_qpos
             self.start_xy = self.data.qpos[root : root + 2].copy()
-            self.check_standing()
+            self.check_upright()
+
+    def set_command(self, *, forward: float = 0.0, yaw_rate: float = 0.0) -> None:
+        if self.policy is None:
+            raise ValueError("Velocity commands require --policy")
+        self.policy.set_command(forward=forward, yaw_rate=yaw_rate)
 
     def step(self):
         if self.policy is not None:
@@ -162,9 +168,9 @@ class Simulation:
                 raise RuntimeError(f"MuJoCo reported {warning.name}")
         self.step_count += 1
         if self.policy is not None:
-            self.check_standing()
+            self.check_upright()
 
-    def check_standing(self):
+    def check_upright(self):
         root = self.policy.root_qpos
         position = self.data.qpos[root : root + 3]
         w, x, y, z = self.data.qpos[root + 3 : root + 7]
@@ -172,14 +178,10 @@ class Simulation:
         drift = np.linalg.norm(position[:2] - self.start_xy)
         self.min_height = min(self.min_height, float(position[2]))
         self.max_tilt = max(self.max_tilt, float(tilt))
-        self.max_drift = max(self.max_drift, float(drift))
-        if (
-            position[2] < MIN_STANDING_HEIGHT
-            or tilt > MAX_STANDING_TILT
-            or drift > MAX_STANDING_DRIFT
-        ):
+        self.max_displacement = max(self.max_displacement, float(drift))
+        if position[2] < MIN_UPRIGHT_HEIGHT or tilt > MAX_UPRIGHT_TILT:
             raise RuntimeError(
-                f"Standing check failed at {self.data.time:.3f}s: "
+                f"Posture check failed at {self.data.time:.3f}s: "
                 f"height={position[2]:.3f}m, tilt={tilt:.1f}deg, drift={drift:.3f}m"
             )
 
@@ -190,10 +192,38 @@ def run_headless(simulation: Simulation, steps: int):
     print(f"Physics OK: {steps} steps, simulation time={simulation.data.time:.3f}s")
     if simulation.policy is not None:
         print(
-            f"Standing OK: min height={simulation.min_height:.3f}m, "
+            f"Posture OK: min height={simulation.min_height:.3f}m, "
             f"max tilt={simulation.max_tilt:.2f}deg, "
-            f"max drift={simulation.max_drift:.4f}m"
+            f"max displacement={simulation.max_displacement:.4f}m"
         )
+
+
+# GLFW arrow key codes supplied by MuJoCo's public key_callback.
+MOTION_KEYS = {
+    265: ("Forward", FORWARD_SPEED, 0.0),  # Up
+    263: ("Turn left", 0.0, TURN_SPEED),  # Left
+    262: ("Turn right", 0.0, -TURN_SPEED),  # Right
+    264: ("Stop (balance remains active)", 0.0, 0.0),  # Down
+}
+
+
+def handle_key(simulation: Simulation, key: int, paused: bool) -> bool:
+    """Apply a queued key on the physics thread and return the pause state."""
+    if key == 32:
+        paused = not paused
+        print("Paused" if paused else "Running")
+    elif key == ord("R"):
+        simulation.reset()
+        paused = True
+        print("Reset; zero command; paused")
+    elif key in MOTION_KEYS and simulation.policy is not None:
+        label, forward, yaw_rate = MOTION_KEYS[key]
+        simulation.set_command(forward=forward, yaw_rate=yaw_rate)
+        print(
+            f"{label}: forward={forward:.2f}m/s, yaw={yaw_rate:.2f}rad/s"
+            + ("; paused (Space to run)" if paused else "")
+        )
+    return paused
 
 
 def run_viewer(simulation: Simulation):
@@ -204,12 +234,18 @@ def run_viewer(simulation: Simulation):
     print("Paused. Space: run/pause | R: reset and pause | Esc/window close: exit")
     if simulation.policy is None:
         print("No walking policy is active. The robot may fall when physics runs.")
+    else:
+        print("Up: forward | Left/Right: turn in place | Down: stop and balance")
+        print("Commands persist until the next arrow key; Space only pauses time.")
     with mujoco.viewer.launch_passive(model, data, key_callback=commands.put) as viewer:
         with viewer.lock():
             viewer.cam.lookat[:] = (0, 0, 0.15)
             viewer.cam.distance = 0.8
             viewer.cam.azimuth = 135
             viewer.cam.elevation = -20
+            if simulation.policy is not None:
+                viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                viewer.cam.trackbodyid = simulation.policy.trunk_id
         last_sync = 0.0
         while viewer.is_running():
             started = time.monotonic()
@@ -219,13 +255,9 @@ def run_viewer(simulation: Simulation):
                         key = commands.get_nowait()
                     except Empty:
                         break
-                    if key == 32:
-                        paused = not paused
-                        print("Paused" if paused else "Running")
-                    elif key == ord("R"):
-                        simulation.reset()
-                        paused = True
-                        print("Reset; paused")
+                    if key == 256:  # Escape
+                        return
+                    paused = handle_key(simulation, key, paused)
                 if not paused:
                     simulation.step()
             if started - last_sync >= 1 / 60:

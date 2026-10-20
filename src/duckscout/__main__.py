@@ -38,7 +38,9 @@ def ensure_viewer_process(arguments: list[str]) -> None:
 
 
 def main(arguments: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="MicroDuck model viewer")
+    parser = argparse.ArgumentParser(
+        description="MicroDuck model viewer and locomotion"
+    )
     parser.add_argument(
         "--scene",
         type=Path,
@@ -53,7 +55,7 @@ def main(arguments: list[str] | None = None) -> int:
         type=Path,
         nargs="?",
         const=Path("assets/vendor/microduck-policies/velstand.onnx"),
-        help="Enable standing with the downloaded policy, or specify an ONNX path",
+        help="Enable locomotion with the downloaded policy, or specify an ONNX path",
     )
     parser.add_argument(
         "--headless", action="store_true", help="Check physics without a window"
