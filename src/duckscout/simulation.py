@@ -2,7 +2,7 @@
 
 import time
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from queue import Empty, SimpleQueue
 
@@ -25,6 +25,7 @@ from duckscout.locomotion import (
     LocomotionPolicy,
 )
 from duckscout.perception import annotate_detection, detect_target, estimate_distance
+from duckscout.runlog import RunLog
 
 # Flat-floor posture limits, independent of distance traveled.
 MIN_UPRIGHT_HEIGHT = 0.08
@@ -32,6 +33,7 @@ MAX_UPRIGHT_TILT = 45.0
 CAMERA_NAME = "head_camera"
 CAMERA_WIDTH = 320
 CAMERA_HEIGHT = 240
+LOG_PERIOD = 0.1  # シミュレーション秒。カメラの有無とは独立した記録周期。
 CAMERA_PERIOD = 0.1  # Simulation seconds; independent of the viewer refresh rate.
 
 
@@ -247,6 +249,7 @@ def observe_camera(
     simulation: Simulation,
     renderer: mujoco.Renderer,
     behavior: Behavior | None = None,
+    log: RunLog | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     rgb = render_head_camera(simulation, renderer)
     detection = detect_target(rgb)
@@ -263,6 +266,14 @@ def observe_camera(
             forward, yaw = behavior.update(detection, distance, simulation.data.time)
             simulation.set_command(forward=forward, yaw_rate=yaw)
             if behavior.state != previous:
+                if log is not None:
+                    log.write(
+                        "event",
+                        float(simulation.data.time),
+                        event="state_changed",
+                        state=behavior.state,
+                        reason=behavior.reason,
+                    )
                 print(
                     f"Auto: {behavior.state} ({behavior.reason}) at {simulation.data.time:.1f}s"
                 )
@@ -271,14 +282,70 @@ def observe_camera(
     return rgb, annotate_detection(rgb, detection, status=status)
 
 
+def start_logging(
+    simulation: Simulation, behavior: Behavior | None, log: RunLog
+) -> None:
+    """実行設定の取り出しはシミュレーション側が担当し、ロガーには通常の値を渡す。"""
+    model = simulation.model
+    log.start(
+        {
+            "physics_timestep_s": float(model.opt.timestep),
+            "sample_period_s": LOG_PERIOD,
+            "initial_qpos": simulation.data.qpos.tolist(),
+            # qpos/qvelはMuJoCoの関節順。自由関節のqposは位置3[m]+四元数4[w,x,y,z]。
+            "joints": [
+                {
+                    "name": model.joint(i).name,
+                    "type": int(model.jnt_type[i]),
+                    "qpos_index": int(model.jnt_qposadr[i]),
+                    "qvel_index": int(model.jnt_dofadr[i]),
+                }
+                for i in range(model.njnt)
+            ],
+            "behavior": None
+            if behavior is None
+            else {
+                f.name: getattr(behavior, f.name) for f in fields(behavior) if f.init
+            },
+        }
+    )
+    log.write(
+        "event",
+        float(simulation.data.time),
+        event="start",
+        state=None if behavior is None else behavior.state,
+    )
+    record_sample(simulation, log)
+
+
+def record_sample(simulation: Simulation, log: RunLog) -> None:
+    """位置・姿勢・速度は加工せず記録する。制御や物理更新は行わない。"""
+    log.write(
+        "sample",
+        float(simulation.data.time),
+        qpos=simulation.data.qpos.tolist(),
+        qvel=simulation.data.qvel.tolist(),
+        command=None
+        if simulation.policy is None
+        else {
+            "forward_m_s": float(simulation.policy.command[0]),
+            "yaw_rate_rad_s": float(simulation.policy.command[2]),
+        },
+    )
+
+
 def run_headless(
     simulation: Simulation,
     steps: int,
     *,
     snapshot: Path | None = None,
     auto: bool = False,
+    log: RunLog | None = None,
 ):
     behavior = make_behavior(simulation) if auto else None
+    if log is not None:
+        start_logging(simulation, behavior, log)
+    next_log = simulation.data.time + LOG_PERIOD
     with (
         mujoco.Renderer(simulation.model, height=CAMERA_HEIGHT, width=CAMERA_WIDTH)
         if auto or snapshot is not None
@@ -287,14 +354,21 @@ def run_headless(
         next_capture = simulation.data.time
         for _ in range(steps):
             if auto and simulation.data.time + 1e-9 >= next_capture:
-                observe_camera(simulation, renderer, behavior)
+                observe_camera(simulation, renderer, behavior, log)
                 next_capture = simulation.data.time + CAMERA_PERIOD
             simulation.step()
+            if log is not None and simulation.data.time + 1e-9 >= next_log:
+                record_sample(simulation, log)
+                next_log = simulation.data.time + LOG_PERIOD
         if snapshot is not None:
-            rgb, preview = observe_camera(simulation, renderer, behavior)
+            rgb, preview = observe_camera(simulation, renderer, behavior, log)
             save_snapshot(snapshot, rgb)
             save_snapshot(snapshot.with_stem(snapshot.stem + "_detection"), preview)
-    print(f"Physics OK: {steps} steps, simulation time={simulation.data.time:.3f}s")
+    if log is not None:
+        log.write("event", float(simulation.data.time), event="step_limit")
+    print(
+        f"Physics OK: {simulation.step_count} steps, simulation time={simulation.data.time:.3f}s"
+    )
     if simulation.policy is not None:
         print(
             f"Posture OK: min height={simulation.min_height:.3f}m, "
@@ -315,9 +389,17 @@ MOTION_KEYS = {
 
 
 def handle_key(
-    simulation: Simulation, key: int, paused: bool, behavior: Behavior | None = None
+    simulation: Simulation,
+    key: int,
+    paused: bool,
+    behavior: Behavior | None = None,
+    log: RunLog | None = None,
 ) -> bool:
     """Apply a queued key on the physics thread and return the pause state."""
+    if log is not None:
+        event = {32: "pause" if not paused else "resume", ord("R"): "reset"}.get(key)
+        if event is not None:
+            log.write("event", float(simulation.data.time), event=event, key=key)
     if key == 32:
         paused = not paused
         print("Paused" if paused else "Running")
@@ -327,11 +409,30 @@ def handle_key(
             behavior.reset(simulation.data.time)
         paused = True
         print("Reset; zero command; paused")
+        if log is not None:
+            log.write(
+                "event",
+                float(simulation.data.time),
+                event="state_changed",
+                state=None if behavior is None else behavior.state,
+                reason="reset",
+            )
+            record_sample(simulation, log)
     elif key in MOTION_KEYS and simulation.policy is not None:
         if behavior is not None:
             behavior.cancel()
         label, forward, yaw_rate = MOTION_KEYS[key]
         simulation.set_command(forward=forward, yaw_rate=yaw_rate)
+        if log is not None:
+            log.write(
+                "event",
+                float(simulation.data.time),
+                event="manual_command",
+                key=key,
+                forward_m_s=forward,
+                yaw_rate_rad_s=yaw_rate,
+                state=None if behavior is None else behavior.state,
+            )
         print(
             f"{label}: forward={forward:.2f}m/s, yaw={yaw_rate:.2f}rad/s"
             + ("; paused (Space to run)" if paused else "")
@@ -367,8 +468,12 @@ def run_viewer(
     camera: str = "follow",
     snapshot: Path = Path("runs/head_camera.ppm"),
     auto: bool = False,
+    log: RunLog | None = None,
 ):
     behavior = make_behavior(simulation) if auto else None
+    if log is not None:
+        start_logging(simulation, behavior, log)
+    next_log = simulation.data.time + LOG_PERIOD
     # GUI callbacks only enqueue commands; the main loop owns physics state.
     commands = SimpleQueue()
     paused = True
@@ -433,7 +538,9 @@ def run_viewer(
                     if key == ord("R") or (behavior is not None and key in MOTION_KEYS):
                         next_capture = 0.0
                     was_paused = paused
-                    paused = handle_key(simulation, key, paused, behavior)
+                    paused = handle_key(simulation, key, paused, behavior, log)
+                    if key == ord("R"):
+                        next_log = data.time + LOG_PERIOD
                     if paused != was_paused or key == ord("R"):
                         next_step = started
                 if paused:
@@ -445,13 +552,16 @@ def run_viewer(
                         if next_step > started + 1e-9:
                             break
                         simulation.step()
+                        if log is not None and data.time + 1e-9 >= next_log:
+                            record_sample(simulation, log)
+                            next_log = data.time + LOG_PERIOD
                         next_step += model.opt.timestep
                     if next_step <= started:
                         next_step = started + model.opt.timestep
                 if renderer is not None and (
                     save_requested or data.time + 1e-9 >= next_capture
                 ):
-                    rgb, preview = observe_camera(simulation, renderer, behavior)
+                    rgb, preview = observe_camera(simulation, renderer, behavior, log)
                     preview_dirty = True
                     next_capture = data.time + CAMERA_PERIOD
             if save_requested:

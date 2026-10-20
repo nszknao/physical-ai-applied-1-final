@@ -1,5 +1,6 @@
 """Tests for duckscout.simulation: physics, control, viewer and camera output."""
 
+import json
 import tempfile
 import unittest
 from contextlib import nullcontext
@@ -17,6 +18,7 @@ from duckscout.locomotion import (
     FORWARD_SPEED,
     TURN_SPEED,
 )
+from duckscout.runlog import RunLog
 from duckscout.simulation import (
     CAMERA_HEIGHT,
     CAMERA_NAME,
@@ -623,6 +625,87 @@ class AutomaticSimulationTests(unittest.TestCase):
             run_headless(sim, 2000, auto=True)
         self.assertEqual(behavior.state, State.ARRIVED)
         np.testing.assert_array_equal(sim.policy.command, np.zeros(13))
+
+    def test_logging_does_not_change_physics_or_stop_after_arrival(self):
+        final_states = []
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            for recording in (False, True):
+                sim = Simulation.from_scene(SEARCH_SCENE, policy_path=POLICY)
+                with (
+                    RunLog(output=output, metadata={})
+                    if recording
+                    else nullcontext() as log,
+                    patch("duckscout.simulation.mujoco.Renderer") as factory,
+                ):
+                    factory.return_value.__enter__.return_value = ProjectedCubeRenderer(
+                        sim.model
+                    )
+                    run_headless(sim, 2400, auto=True, log=log)
+                self.assertEqual(sim.step_count, 2400)
+                final_states.append((sim.data.qpos.copy(), sim.data.qvel.copy()))
+            np.testing.assert_array_equal(final_states[0][0], final_states[1][0])
+            np.testing.assert_array_equal(final_states[0][1], final_states[1][1])
+            records = [
+                json.loads(line)
+                for line in (output / "records.jsonl").read_text().splitlines()
+            ]
+            samples = [r for r in records if r["kind"] == "sample"]
+            self.assertEqual(len(samples), 121)
+            arrived = next(r for r in records if r.get("state") == "ARRIVED")
+            self.assertGreater(samples[-1]["time_s"], arrived["time_s"] + 5)
+            self.assertEqual(
+                samples[-1]["command"], {"forward_m_s": 0, "yaw_rate_rad_s": 0}
+            )
+            self.assertFalse((output / "result.json").exists())
+
+    def test_viewer_records_reset_manual_command_and_exit(self):
+        for key, event in ((ord("R"), "reset"), (264, "manual_command"), (256, "exit")):
+            with self.subTest(event=event):
+                sim = Simulation.from_scene(SEARCH_SCENE, policy_path=POLICY)
+                sim.step()
+                backend = Mock(exitrequest=0, viewport=mujoco.MjrRect(0, 0, 800, 600))
+                backend.lock.return_value = nullcontext()
+                backend.sync.side_effect = lambda _: setattr(backend, "exitrequest", 1)
+                viewer = mujoco.viewer.Handle(
+                    backend,
+                    mujoco.MjvCamera(),
+                    mujoco.MjvOption(),
+                    mujoco.MjvPerturb(),
+                    None,
+                )
+
+                def launch(*args, key_callback):
+                    key_callback(key)
+                    return viewer
+
+                with tempfile.TemporaryDirectory() as directory:
+                    output = Path(directory) / "run"
+                    with (
+                        RunLog(output=output, metadata={}) as log,
+                        patch("duckscout.simulation.mujoco.Renderer") as factory,
+                        patch(
+                            "duckscout.simulation.mujoco.viewer.launch_passive",
+                            side_effect=launch,
+                        ),
+                        patch("duckscout.simulation.time.sleep"),
+                    ):
+                        factory.return_value.__enter__.return_value = (
+                            ProjectedCubeRenderer(sim.model)
+                        )
+                        run_viewer(sim, auto=True, log=log)
+                    rows = [
+                        json.loads(line)
+                        for line in (output / "records.jsonl").read_text().splitlines()
+                    ]
+                    self.assertIn(event, [r.get("event") for r in rows])
+                    if key == ord("R"):
+                        reset_index = next(
+                            i for i, r in enumerate(rows) if r.get("event") == "reset"
+                        )
+                        self.assertGreater(rows[reset_index]["time_s"], 0)
+                        self.assertEqual(rows[reset_index + 1]["time_s"], 0)
+                        self.assertEqual(rows[reset_index + 2]["kind"], "sample")
 
     def test_auto_requires_locomotion_and_named_camera(self):
         with self.assertRaisesRegex(ValueError, "policy"):

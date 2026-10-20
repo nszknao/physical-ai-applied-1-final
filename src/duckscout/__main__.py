@@ -5,8 +5,10 @@ import math
 import os
 import sys
 import sysconfig
+from contextlib import nullcontext
 from pathlib import Path
 
+from duckscout.runlog import RunLog, run_metadata
 from duckscout.simulation import Simulation, run_headless, run_viewer
 
 
@@ -59,6 +61,11 @@ def main(arguments: list[str] | None = None) -> int:
         type=float,
         metavar=("X", "Y"),
         help="Override target placement in metres for this run",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Record settings, state and events in a new directory",
     )
     parser.add_argument("--keyframe", default="STAND", help="Initial named pose")
     parser.add_argument(
@@ -113,15 +120,30 @@ def main(arguments: list[str] | None = None) -> int:
             policy_path=args.policy,
             target_position=tuple(args.target) if args.target is not None else None,
         )
-        if args.headless:
-            run_headless(simulation, args.steps, snapshot=args.snapshot, auto=args.auto)
-        else:
-            run_viewer(
-                simulation,
-                camera=args.camera,
-                snapshot=args.snapshot or Path("runs/head_camera.ppm"),
-                auto=args.auto,
+        with (
+            RunLog(
+                output=args.output,
+                metadata=run_metadata(vars(args)),
             )
+            if args.output is not None
+            else nullcontext()
+        ) as log:
+            if args.headless:
+                run_headless(
+                    simulation,
+                    args.steps,
+                    snapshot=args.snapshot,
+                    auto=args.auto,
+                    log=log,
+                )
+            else:
+                run_viewer(
+                    simulation,
+                    camera=args.camera,
+                    snapshot=args.snapshot or Path("runs/head_camera.ppm"),
+                    auto=args.auto,
+                    log=log,
+                )
     except (ImportError, OSError, KeyError, ValueError, RuntimeError) as error:
         print(f"duckscout: {error}", file=sys.stderr)
         return 1

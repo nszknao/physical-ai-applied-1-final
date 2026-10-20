@@ -1,8 +1,10 @@
 """Tests for duckscout.__main__: CLI validation and process launch routing."""
 
+import json
 import os
 import sys
 import sysconfig
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -70,6 +72,29 @@ class ArgumentTests(unittest.TestCase):
                     with self.assertRaises(SystemExit):
                         main(arguments)
                 load.assert_not_called()
+
+    def test_output_without_policy_or_camera_records_run_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            with patch(
+                "duckscout.simulation.mujoco.Renderer",
+                side_effect=AssertionError("Graphics created"),
+            ):
+                self.assertEqual(
+                    main(["--headless", "--steps", "2", "--output", str(output)]), 0
+                )
+            records = [
+                json.loads(line)
+                for line in (output / "records.jsonl").read_text().splitlines()
+            ]
+            config = json.loads((output / "config.json").read_text())
+            self.assertEqual(records[-2]["event"], "step_limit")
+            self.assertEqual(records[-1]["reason"], "closed")
+            self.assertIsNone(records[1]["command"])
+            self.assertIn("runlog.py", " ".join(config["python_sources_sha256"]))
+            self.assertIn("onnxruntime", config["versions"])
+            self.assertEqual(len(config["inputs_sha256"]), 3)
+            self.assertFalse((output / "result.json").exists())
 
     def test_rejects_wrong_extension_before_starting_simulation(self):
         with patch("duckscout.__main__.Simulation.from_scene") as load:

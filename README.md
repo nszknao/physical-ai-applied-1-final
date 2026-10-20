@@ -92,7 +92,7 @@ RGB画像は320×240で、シミュレーション時間基準で10 Hzで取得�
 uv run python -m duckscout --policy --headless --steps 400 --snapshot runs/head_camera.ppm
 ```
 
-画像保存を指定したheadless実行にはOpenGLの描画環境が必要です。`--snapshot` を付けないheadless実行は描画コンテキストを作りません。
+画像保存を指定したheadless実行にはOpenGLの描画環境が必要です。`--snapshot` と `--auto` を付けないheadless実行は描画コンテキストを作りません。
 
 ## 対象検出
 
@@ -156,6 +156,35 @@ uv run python -m duckscout --policy --auto --target 0.4 0.7
 uv run python -m duckscout --policy --auto --headless --steps 12600 --snapshot runs/auto.ppm
 ```
 
+## 実行ログ
+
+```sh
+uv run python -m duckscout --policy --auto --output runs/front-01
+```
+
+Spaceで開始し、確認したいところまで動かしてEscで終了します。`--output` は手動操作や方策なしのheadless実行にも使えます。記録を有効にしても、到着後の待ち時間や自動終了は追加しません。headlessは指定した `--steps` まで実行します。
+
+| ファイル | 内容 |
+|---|---|
+| `config.json` | 起動引数、初期状態、関節の配列位置、制御・記録周期、コード／方策の識別情報、実行環境 |
+| `records.jsonl` | 時系列データとイベント。1行が1件のJSON |
+
+位置・姿勢・速度・移動指令はシミュレーション時間で10 Hz、開始時とリセット直後にも記録します。状態変更、一時停止・再開、手動指令、リセット、終了・エラーはイベントとして記録します。一時停止中は定期記録を増やしません。データは行ごとにファイルへ書き出され、実行中にも読めます。
+
+```sh
+tail -n 5 runs/front-01/records.jsonl
+```
+
+- `kind`：`sample` が時系列データ、`event` がイベント。
+- `time_s`：シミュレーション時刻。Rで0へ戻るため、ログは行順に読み、`reset` イベントで区切ります。
+- `qpos`：MuJoCoの関節位置・姿勢の配列。`config.json` の `joints` に各関節の開始インデックスを保存します。胴体の自由関節は世界位置3要素[m]と四元数4要素[w, x, y, z]です。
+- `qvel`：関節速度の配列。自由関節は世界座標での並進速度3要素[m/s]と局所座標での角速度3要素[rad/s]です。回転関節の位置・速度はrad・rad/sです。
+- `command`：方策への前進速度[m/s]と旋回速度[rad/s]。方策なしでは `null`。
+
+`ARRIVED` などの状態名はそのまま記録し、成否の判定や集計は行いません。終了イベントの `reason` は `closed`・`interrupted`・`error` のいずれかです。ロガーはシミュレータの時計を直接参照しないため、このイベントの `time_s` は `null` とし、最後に記録した時刻を `last_record_time_s` に添えます。
+
+既存の出力ディレクトリは上書きしません。Rや手動への切り替え後も同じログへ記録を続けます。別の実行は `runs/front-02` など新しい保存先で起動してください。
+
 ## 検証
 
 ```sh
@@ -168,7 +197,7 @@ uv run ruff format --check .
 
 `--check` はネットワークを使わず素材を検証します。`--headless` は物理更新と数値状態を確認します。`--policy` 併用時は高さ・傾きも検証します。表示やキー操作の確認は別途必要です。実方策のテストは素材取得後に実行され、ファイルがない場合はskipと表示されます。立位維持に加え、前進・左右旋回からの停止、旋回後の前進をシミュレーション時間で検証します。
 
-テストファイルはソース単位で対応させています。`test_main.py` は `__main__.py`、`test_locomotion.py` は `locomotion.py`、`test_perception.py` は `perception.py`、`test_behavior.py` は `behavior.py`、`test_simulation.py` は `simulation.py`、`test_fetch_assets.py` は `scripts/fetch_assets.py` を対象にします。シミュレーションを通じた移動やカメラの検証も `test_simulation.py` に置き、共通の素材パス・モック方策・テスト用の投影画像生成を `tests/helpers.py` にまとめています。
+テストファイルはソース単位で対応させています。`test_main.py` は `__main__.py`、`test_locomotion.py` は `locomotion.py`、`test_perception.py` は `perception.py`、`test_behavior.py` は `behavior.py`、`test_runlog.py` は `runlog.py`、`test_simulation.py` は `simulation.py`、`test_fetch_assets.py` は `scripts/fetch_assets.py` を対象にします。シミュレーションを通じた移動やカメラの検証も `test_simulation.py` に置き、共通の素材パス・モック方策・テスト用の投影画像生成を `tests/helpers.py` にまとめています。
 
 コードのlint・フォーマットには開発用依存のRuffを使用します。整形を適用する場合は `uv run ruff format .` を実行してください。
 
