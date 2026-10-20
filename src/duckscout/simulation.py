@@ -1,0 +1,586 @@
+"""MuJoCo state, BAM motor control, and paused/headless execution."""
+
+import time
+from contextlib import nullcontext
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+from queue import Empty, SimpleQueue
+
+import cv2
+import mujoco
+import mujoco.viewer
+import numpy as np
+from bam.model import Model as BamModel
+from bam.model import load_model
+from bam.mujoco import MujocoController
+
+from duckscout.behavior import Behavior, State
+from duckscout.locomotion import (
+    CONTROL_DECIMATION,
+    DEFAULT_POSE,
+    FORWARD_SPEED,
+    JOINT_NAMES,
+    PHYSICS_TIMESTEP,
+    TURN_SPEED,
+    LocomotionPolicy,
+)
+from duckscout.perception import annotate_detection, detect_target, estimate_distance
+from duckscout.runlog import RunLog
+
+# Flat-floor posture limits, independent of distance traveled.
+MIN_UPRIGHT_HEIGHT = 0.08
+MAX_UPRIGHT_TILT = 45.0
+CAMERA_NAME = "head_camera"
+CAMERA_WIDTH = 320
+CAMERA_HEIGHT = 240
+LOG_PERIOD = 0.1  # シミュレーション秒。カメラの有無とは独立した記録周期。
+CAMERA_PERIOD = 0.1  # Simulation seconds; independent of the viewer refresh rate.
+
+
+def configure_bam(spec: mujoco.MjSpec) -> BamModel:
+    """Configure the scene for XL330 M6 motors and return their BAM model."""
+    # Mirror upstream's CPU rehearsal: voltage motor + M6 friction.
+    bam = load_model(motor_name="xl330", model="m6")
+    bam.actuator.kp = 200.0
+    bam.actuator.vin = 7.4
+    bam.actuator.max_current = None
+    force_limit = 7.4 * bam.kt.value / bam.R.value
+    if tuple(act.name for act in spec.actuators) != JOINT_NAMES:
+        raise ValueError("Scene actuator order does not match velstand")
+    for actuator in spec.actuators:
+        if actuator.target != actuator.name:
+            raise ValueError(f"Unexpected joint target: {actuator.name}")
+        actuator.set_to_motor()
+        actuator.forcelimited = True
+        actuator.forcerange = (-force_limit, force_limit)
+        actuator.ctrllimited = False
+        actuator.gear = [1, 0, 0, 0, 0, 0]
+    for joint in spec.joints:
+        if joint.name in JOINT_NAMES:
+            joint.damping = np.zeros((3, 1))
+            joint.frictionloss = 0.0
+            joint.solref_friction = (-5e4, -2e2)
+            joint.solimp_friction = (0.99, 0.9999, 0.001, 0.5, 2.0)
+    return bam
+
+
+@dataclass(kw_only=True, eq=False)
+class Simulation:
+    """Own physics and control state; use from_scene() to assemble dependencies."""
+
+    # Injected dependencies. BAM and policy are supplied together for locomotion.
+    model: mujoco.MjModel
+    data: mujoco.MjData
+    key_id: int
+    bam: BamModel | None = None
+    policy: LocomotionPolicy | None = None
+
+    # Runtime state, initialized here and restored by reset().
+    motors: MujocoController | None = field(init=False, default=None)
+    step_count: int = field(init=False, default=0)
+    min_height: float = field(init=False, default=float("inf"))
+    max_tilt: float = field(init=False, default=0.0)
+    max_displacement: float = field(init=False, default=0.0)
+    start_xy: np.ndarray = field(init=False, default_factory=lambda: np.zeros(2))
+
+    def __post_init__(self) -> None:
+        if (self.bam is None) != (self.policy is None):
+            raise ValueError("BAM and locomotion policy must be supplied together")
+        self.reset()
+
+    @classmethod
+    def from_scene(
+        cls,
+        path: Path,
+        *,
+        keyframe: str = "STAND",
+        policy_path: Path | None = None,
+        target_position: tuple[float, float] | None = None,
+    ) -> "Simulation":
+        if policy_path is not None and keyframe != "STAND":
+            raise ValueError("Locomotion policy requires --keyframe STAND")
+        bam = None
+        policy = None
+        spec = mujoco.MjSpec.from_file(str(path.resolve()))
+        if target_position is not None:
+            target = spec.geom("target")
+            if target is None or not np.isfinite(target_position).all():
+                raise ValueError(
+                    "--target requires a named target geom and finite coordinates"
+                )
+            target.pos[:2] = target_position
+        head_camera = spec.camera(CAMERA_NAME)
+        if head_camera is not None and np.allclose(head_camera.quat, (0, 0, -1, 0)):
+            # The upstream camera looks backward with a sideways image. In the
+            # jaw frame, -Z is forward and +X is up: rotate camera axes -90° on Z.
+            head_camera.quat = (np.sqrt(0.5), 0, 0, -np.sqrt(0.5))
+        if policy_path is not None:
+            bam = configure_bam(spec)
+            spec.option.timestep = PHYSICS_TIMESTEP
+        model = spec.compile()
+        data = mujoco.MjData(model)
+        key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, keyframe)
+        if key_id < 0:
+            raise ValueError(f"Unknown keyframe: {keyframe}")
+        if not np.isfinite(model.opt.timestep) or model.opt.timestep <= 0:
+            raise ValueError("The model must have a positive finite timestep")
+        if policy_path is not None:
+            policy = LocomotionPolicy.from_onnx(model, policy_path)
+        simulation = cls(model=model, data=data, key_id=key_id, bam=bam, policy=policy)
+        print(f"Loaded {path.name}: nq={model.nq}, nv={model.nv}, actuators={model.nu}")
+        if policy is not None:
+            print(
+                "Locomotion: CPU policy 50 Hz | BAM XL330 M6 / physics 200 Hz | zero command"
+            )
+
+        return simulation
+
+    def reset(self):
+        if self.policy is not None:
+            # BAM changes model friction as well as MjData; reset both.
+            self.model.dof_damping[self.policy.qvel_indices] = 0
+            self.model.dof_frictionloss[self.policy.qvel_indices] = 0
+        mujoco.mj_resetDataKeyframe(self.model, self.data, self.key_id)
+        if self.policy is not None:
+            self.bam.reset()
+            # Recreate through the public API to clear all controller history.
+            self.motors = MujocoController(
+                self.bam,
+                list(JOINT_NAMES),
+                self.model,
+                self.data,
+                vin_drop_gain=0.1,
+                vin_min=6.0,
+            )
+            root = self.policy.root_qpos
+            self.data.qpos[root : root + 7] = (0, 0, 0.125, 1, 0, 0, 0)
+            self.data.qpos[self.policy.qpos_indices] = DEFAULT_POSE
+            self.data.ctrl[:] = 0
+            self.policy.reset()
+            self.motors.reset(self.data.qpos)
+        mujoco.mj_forward(self.model, self.data)
+        self.step_count = 0
+        self.min_height = float("inf")
+        self.max_tilt = 0.0
+        self.max_displacement = 0.0
+        if self.policy is not None:
+            root = self.policy.root_qpos
+            self.start_xy = self.data.qpos[root : root + 2].copy()
+            self.check_upright()
+
+    def set_command(self, *, forward: float = 0.0, yaw_rate: float = 0.0) -> None:
+        if self.policy is None:
+            raise ValueError("Velocity commands require --policy")
+        self.policy.set_command(forward=forward, yaw_rate=yaw_rate)
+
+    def step(self):
+        if self.policy is not None:
+            if self.step_count % CONTROL_DECIMATION == 0:
+                self.motors.q_target[:] = self.policy.targets(self.data)
+            self.motors.update()
+        previous_time = self.data.time
+        mujoco.mj_step(self.model, self.data)
+        if self.data.time <= previous_time or not all(
+            np.isfinite(values).all()
+            for values in (self.data.qpos, self.data.qvel, self.data.qacc)
+        ):
+            raise RuntimeError("Physics became unstable; stop and reset the simulation")
+        for warning in (
+            mujoco.mjtWarning.mjWARN_BADQPOS,
+            mujoco.mjtWarning.mjWARN_BADQVEL,
+            mujoco.mjtWarning.mjWARN_BADQACC,
+            mujoco.mjtWarning.mjWARN_BADCTRL,
+        ):
+            if self.data.warning[warning].number:
+                raise RuntimeError(f"MuJoCo reported {warning.name}")
+        self.step_count += 1
+        if self.policy is not None:
+            self.check_upright()
+
+    def check_upright(self):
+        root = self.policy.root_qpos
+        position = self.data.qpos[root : root + 3]
+        w, x, y, z = self.data.qpos[root + 3 : root + 7]
+        tilt = np.degrees(np.arccos(np.clip(1 - 2 * (x * x + y * y), -1, 1)))
+        drift = np.linalg.norm(position[:2] - self.start_xy)
+        self.min_height = min(self.min_height, float(position[2]))
+        self.max_tilt = max(self.max_tilt, float(tilt))
+        self.max_displacement = max(self.max_displacement, float(drift))
+        if position[2] < MIN_UPRIGHT_HEIGHT or tilt > MAX_UPRIGHT_TILT:
+            raise RuntimeError(
+                f"Posture check failed at {self.data.time:.3f}s: "
+                f"height={position[2]:.3f}m, tilt={tilt:.1f}deg, drift={drift:.3f}m"
+            )
+
+
+def render_head_camera(simulation: Simulation, renderer: mujoco.Renderer) -> np.ndarray:
+    """Read RGB at the current pose without advancing physics or the policy."""
+    # mj_step leaves position-derived fields at the previous integration state.
+    # Refresh only poses, avoiding another dynamics/constraint solver evaluation.
+    mujoco.mj_kinematics(simulation.model, simulation.data)
+    mujoco.mj_camlight(simulation.model, simulation.data)
+    renderer.update_scene(simulation.data, camera=CAMERA_NAME)
+    return renderer.render()
+
+
+def save_snapshot(path: Path, rgb: np.ndarray) -> None:
+    """Save lossless RGB as binary PPM without an image-library dependency."""
+    if path.suffix.lower() != ".ppm":
+        raise ValueError("Snapshot path must end in .ppm")
+    height, width, channels = rgb.shape
+    if channels != 3 or rgb.dtype != np.uint8:
+        raise ValueError("Snapshot must be an RGB uint8 image")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(f"P6\n{width} {height}\n255\n".encode("ascii") + rgb.tobytes())
+    print(f"Saved head camera: {path} ({width}x{height} RGB)")
+
+
+def make_behavior(simulation: Simulation) -> Behavior:
+    if simulation.policy is None:
+        raise ValueError("--auto requires --policy")
+    if mujoco.mj_name2id(simulation.model, mujoco.mjtObj.mjOBJ_CAMERA, CAMERA_NAME) < 0:
+        raise ValueError(f"--auto requires {CAMERA_NAME}")
+    behavior = Behavior(image_width=CAMERA_WIDTH)
+    behavior.reset(simulation.data.time)
+    return behavior
+
+
+def observe_camera(
+    simulation: Simulation,
+    renderer: mujoco.Renderer,
+    behavior: Behavior | None = None,
+    log: RunLog | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    rgb = render_head_camera(simulation, renderer)
+    detection = detect_target(rgb)
+    status = None
+    if behavior is not None:
+        distance = estimate_distance(
+            detection,
+            image_width=CAMERA_WIDTH,
+            image_height=CAMERA_HEIGHT,
+            vertical_fov=float(simulation.model.camera(CAMERA_NAME).fovy[0]),
+        )
+        if behavior.state != State.MANUAL:
+            previous = behavior.state
+            forward, yaw = behavior.update(detection, distance, simulation.data.time)
+            simulation.set_command(forward=forward, yaw_rate=yaw)
+            if behavior.state != previous:
+                if log is not None:
+                    log.write(
+                        "event",
+                        float(simulation.data.time),
+                        event="state_changed",
+                        state=behavior.state,
+                        reason=behavior.reason,
+                    )
+                print(
+                    f"Auto: {behavior.state} ({behavior.reason}) at {simulation.data.time:.1f}s"
+                )
+        distance_label = "--" if distance is None else f"~{distance:.2f}m"
+        status = f"{behavior.state} | {distance_label}\n{behavior.reason}"
+    return rgb, annotate_detection(rgb, detection, status=status)
+
+
+def start_logging(
+    simulation: Simulation, behavior: Behavior | None, log: RunLog
+) -> None:
+    """実行設定の取り出しはシミュレーション側が担当し、ロガーには通常の値を渡す。"""
+    model = simulation.model
+    log.start(
+        {
+            "physics_timestep_s": float(model.opt.timestep),
+            "sample_period_s": LOG_PERIOD,
+            "initial_qpos": simulation.data.qpos.tolist(),
+            # qpos/qvelはMuJoCoの関節順。自由関節のqposは位置3[m]+四元数4[w,x,y,z]。
+            "joints": [
+                {
+                    "name": model.joint(i).name,
+                    "type": int(model.jnt_type[i]),
+                    "qpos_index": int(model.jnt_qposadr[i]),
+                    "qvel_index": int(model.jnt_dofadr[i]),
+                }
+                for i in range(model.njnt)
+            ],
+            "behavior": None
+            if behavior is None
+            else {
+                f.name: getattr(behavior, f.name) for f in fields(behavior) if f.init
+            },
+        }
+    )
+    log.write(
+        "event",
+        float(simulation.data.time),
+        event="start",
+        state=None if behavior is None else behavior.state,
+    )
+    record_sample(simulation, log)
+
+
+def record_sample(simulation: Simulation, log: RunLog) -> None:
+    """位置・姿勢・速度は加工せず記録する。制御や物理更新は行わない。"""
+    log.write(
+        "sample",
+        float(simulation.data.time),
+        qpos=simulation.data.qpos.tolist(),
+        qvel=simulation.data.qvel.tolist(),
+        command=None
+        if simulation.policy is None
+        else {
+            "forward_m_s": float(simulation.policy.command[0]),
+            "yaw_rate_rad_s": float(simulation.policy.command[2]),
+        },
+    )
+
+
+def run_headless(
+    simulation: Simulation,
+    steps: int,
+    *,
+    snapshot: Path | None = None,
+    auto: bool = False,
+    log: RunLog | None = None,
+):
+    behavior = make_behavior(simulation) if auto else None
+    if log is not None:
+        start_logging(simulation, behavior, log)
+    next_log = simulation.data.time + LOG_PERIOD
+    with (
+        mujoco.Renderer(simulation.model, height=CAMERA_HEIGHT, width=CAMERA_WIDTH)
+        if auto or snapshot is not None
+        else nullcontext()
+    ) as renderer:
+        next_capture = simulation.data.time
+        for _ in range(steps):
+            if auto and simulation.data.time + 1e-9 >= next_capture:
+                observe_camera(simulation, renderer, behavior, log)
+                next_capture = simulation.data.time + CAMERA_PERIOD
+            simulation.step()
+            if log is not None and simulation.data.time + 1e-9 >= next_log:
+                record_sample(simulation, log)
+                next_log = simulation.data.time + LOG_PERIOD
+        if snapshot is not None:
+            rgb, preview = observe_camera(simulation, renderer, behavior, log)
+            save_snapshot(snapshot, rgb)
+            save_snapshot(snapshot.with_stem(snapshot.stem + "_detection"), preview)
+    if log is not None:
+        log.write("event", float(simulation.data.time), event="step_limit")
+    print(
+        f"Physics OK: {simulation.step_count} steps, simulation time={simulation.data.time:.3f}s"
+    )
+    if simulation.policy is not None:
+        print(
+            f"Posture OK: min height={simulation.min_height:.3f}m, "
+            f"max tilt={simulation.max_tilt:.2f}deg, "
+            f"max displacement={simulation.max_displacement:.4f}m"
+        )
+    if behavior is not None:
+        print(f"Auto: {behavior.state} ({behavior.reason})")
+
+
+# GLFW arrow key codes supplied by MuJoCo's public key_callback.
+MOTION_KEYS = {
+    265: ("Forward", FORWARD_SPEED, 0.0),  # Up
+    263: ("Turn left", 0.0, TURN_SPEED),  # Left
+    262: ("Turn right", 0.0, -TURN_SPEED),  # Right
+    264: ("Stop (balance remains active)", 0.0, 0.0),  # Down
+}
+
+
+def handle_key(
+    simulation: Simulation,
+    key: int,
+    paused: bool,
+    behavior: Behavior | None = None,
+    log: RunLog | None = None,
+) -> bool:
+    """Apply a queued key on the physics thread and return the pause state."""
+    if log is not None:
+        event = {32: "pause" if not paused else "resume", ord("R"): "reset"}.get(key)
+        if event is not None:
+            log.write("event", float(simulation.data.time), event=event, key=key)
+    if key == 32:
+        paused = not paused
+        print("Paused" if paused else "Running")
+    elif key == ord("R"):
+        simulation.reset()
+        if behavior is not None:
+            behavior.reset(simulation.data.time)
+        paused = True
+        print("Reset; zero command; paused")
+        if log is not None:
+            log.write(
+                "event",
+                float(simulation.data.time),
+                event="state_changed",
+                state=None if behavior is None else behavior.state,
+                reason="reset",
+            )
+            record_sample(simulation, log)
+    elif key in MOTION_KEYS and simulation.policy is not None:
+        if behavior is not None:
+            behavior.cancel()
+        label, forward, yaw_rate = MOTION_KEYS[key]
+        simulation.set_command(forward=forward, yaw_rate=yaw_rate)
+        if log is not None:
+            log.write(
+                "event",
+                float(simulation.data.time),
+                event="manual_command",
+                key=key,
+                forward_m_s=forward,
+                yaw_rate_rad_s=yaw_rate,
+                state=None if behavior is None else behavior.state,
+            )
+        print(
+            f"{label}: forward={forward:.2f}m/s, yaw={yaw_rate:.2f}rad/s"
+            + ("; paused (Space to run)" if paused else "")
+        )
+    return paused
+
+
+def show_camera_preview(viewer: mujoco.viewer.Handle, image: np.ndarray) -> None:
+    """Overlay the annotated head image inside the current 3D viewport."""
+    viewport = viewer.viewport
+    if viewport is None or viewport.width <= 16 or viewport.height <= 16:
+        viewer.clear_images()
+        return
+    height, width = image.shape[:2]
+    scale = min(
+        2.0, (viewport.width - 16) / (3 * width), (viewport.height - 16) / height
+    )
+    size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    preview = cv2.resize(image, size, interpolation=cv2.INTER_NEAREST)
+    rect = mujoco.MjrRect(
+        viewport.left + viewport.width - size[0] - 8,
+        viewport.bottom + 8,
+        size[0],
+        size[1],
+    )
+    # set_images handles the RGB-to-OpenGL vertical flip. Call outside viewer.lock().
+    viewer.set_images((rect, preview))
+
+
+def run_viewer(
+    simulation: Simulation,
+    *,
+    camera: str = "follow",
+    snapshot: Path = Path("runs/head_camera.ppm"),
+    auto: bool = False,
+    log: RunLog | None = None,
+):
+    behavior = make_behavior(simulation) if auto else None
+    if log is not None:
+        start_logging(simulation, behavior, log)
+    next_log = simulation.data.time + LOG_PERIOD
+    # GUI callbacks only enqueue commands; the main loop owns physics state.
+    commands = SimpleQueue()
+    paused = True
+    model, data = simulation.model, simulation.data
+    camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, CAMERA_NAME)
+    if camera == "head" and camera_id < 0:
+        raise ValueError(f"Scene has no {CAMERA_NAME} camera")
+    print("Paused. Space: run/pause | R: reset and pause | Esc/window close: exit")
+    if simulation.policy is None:
+        print("No walking policy is active. The robot may fall when physics runs.")
+    else:
+        print("Up: forward | Left/Right: turn in place | Down: stop and balance")
+        print("Commands persist until the next arrow key; Space only pauses time.")
+    if auto:
+        print("Auto enabled. Arrow keys: switch to manual | R: reset auto and pause")
+    if camera_id >= 0:
+        print(
+            "Rendering > Camera: Tracking/head_camera | Enter: save raw + detection PPM"
+        )
+        print("Bottom-right: head camera, green target box and yellow center (10 Hz)")
+    with (
+        (
+            mujoco.Renderer(model, height=CAMERA_HEIGHT, width=CAMERA_WIDTH)
+            if camera_id >= 0
+            else nullcontext()
+        ) as renderer,
+        mujoco.viewer.launch_passive(model, data, key_callback=commands.put) as viewer,
+    ):
+        with viewer.lock():
+            viewer.cam.lookat[:] = (0, 0, 0.15)
+            viewer.cam.distance = 0.8
+            viewer.cam.azimuth = 135
+            viewer.cam.elevation = -20
+            if simulation.policy is not None:
+                viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                viewer.cam.trackbodyid = simulation.policy.trunk_id
+                # Native Tracking selection uses the selected body.
+                viewer.perturb.select = simulation.policy.trunk_id
+            if camera == "head":
+                viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+                viewer.cam.fixedcamid = camera_id
+        last_sync = 0.0
+        next_step = time.monotonic()
+        preview_dirty = False
+        last_viewport = None
+        next_capture = 0.0
+        rgb = None
+        preview = None
+        while viewer.is_running():
+            started = time.monotonic()
+            save_requested = False
+            with viewer.lock():
+                while True:
+                    try:
+                        key = commands.get_nowait()
+                    except Empty:
+                        break
+                    if key == 256:  # Escape
+                        return
+                    if key == 257 and renderer is not None:  # Enter
+                        save_requested = True
+                    if key == ord("R") or (behavior is not None and key in MOTION_KEYS):
+                        next_capture = 0.0
+                    was_paused = paused
+                    paused = handle_key(simulation, key, paused, behavior, log)
+                    if key == ord("R"):
+                        next_log = data.time + LOG_PERIOD
+                    if paused != was_paused or key == ord("R"):
+                        next_step = started
+                if paused:
+                    next_step = started
+                else:
+                    # Keep fixed physics steps, but recover time spent rendering.
+                    # Bound catch-up after a long stall so input stays responsive.
+                    for _ in range(20):
+                        if next_step > started + 1e-9:
+                            break
+                        simulation.step()
+                        if log is not None and data.time + 1e-9 >= next_log:
+                            record_sample(simulation, log)
+                            next_log = data.time + LOG_PERIOD
+                        next_step += model.opt.timestep
+                    if next_step <= started:
+                        next_step = started + model.opt.timestep
+                if renderer is not None and (
+                    save_requested or data.time + 1e-9 >= next_capture
+                ):
+                    rgb, preview = observe_camera(simulation, renderer, behavior, log)
+                    preview_dirty = True
+                    next_capture = data.time + CAMERA_PERIOD
+            if save_requested:
+                save_snapshot(snapshot, rgb)
+                save_snapshot(snapshot.with_stem(snapshot.stem + "_detection"), preview)
+            if started - last_sync >= 1 / 60:
+                viewer.sync()
+                viewport = viewer.viewport
+                viewport_size = (
+                    (viewport.left, viewport.bottom, viewport.width, viewport.height)
+                    if viewport is not None
+                    else None
+                )
+                if preview is not None and (
+                    preview_dirty or viewport_size != last_viewport
+                ):
+                    show_camera_preview(viewer, preview)
+                    preview_dirty = False
+                    last_viewport = viewport_size
+                last_sync = started
+            wake_at = started + 1 / 60 if paused else next_step
+            time.sleep(max(0, wake_at - time.monotonic()))

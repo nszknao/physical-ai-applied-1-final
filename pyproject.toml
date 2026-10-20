@@ -1,10 +1,32 @@
+[build-system]
+requires = ["uv_build==0.8.19"]
+build-backend = "uv_build"
+
 [project]
 name = "duckscout"
 version = "0.1.0"
 description = "A MicroDuck robot that searches for a target, approaches it, and stops."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "mujoco==3.10.0",
+    "numpy>=2,<3",
+    "onnxruntime>=1.24.4,<2",
+    "better-actuator-models[mujoco]",
+    "opencv-python-headless>=4.10,<5",
+]
+
+[dependency-groups]
+dev = [
+    "ruff==0.16.0",
+]
 
 [tool.uv]
-package = false
+required-version = ">=0.9.17"
+exclude-newer = "1 day"
+
+[tool.uv.sources]
+better-actuator-models = { git = "https://github.com/Rhoban/bam.git", rev = "62bd8ce12154340be97e06f7f41a0ca8f116d967" }
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

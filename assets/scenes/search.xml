@@ -1,0 +1,9 @@
+<mujoco model="duckscout_search">
+  <include file="../vendor/microduck_rl/src/mjlab_microduck/robot/microduck/scene.xml"/>
+  <compiler meshdir="../vendor/microduck_rl/src/mjlab_microduck/robot/microduck/assets"/>
+  <worldbody>
+    <!-- Fixed cube, side length 8 cm, centered 80 cm ahead of the start. -->
+    <geom name="target" type="box" pos="0.8 0 0.04" size="0.04 0.04 0.04"
+          rgba="1 0.02 0.02 1" contype="1" conaffinity="1"/>
+  </worldbody>
+</mujoco>

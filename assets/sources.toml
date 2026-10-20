@@ -1,0 +1,224 @@
+[source]
+repository = "https://github.com/pollen-robotics/microduck_rl"
+base_url = "https://raw.githubusercontent.com/pollen-robotics/microduck_rl"
+revision = "b02fdea4902c2b93b7d34a83a6f05da4ececb7d3"
+
+[[files]]
+path = "LICENSE"
+git_blob_sha1 = "5babf660c98eac4418422e1a62a5d9fc51a4d63e"
+size = 11351
+
+[[files]]
+path = "LICENSE-MODELS.md"
+git_blob_sha1 = "b7eb7fc4c20a686984d7d19b0b2f1f9750252e76"
+size = 1148
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/scene.xml"
+git_blob_sha1 = "a3848be52113a50138d54921748733f09488d496"
+size = 2350
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/robot_groundcontact.xml"
+git_blob_sha1 = "18b50b58e251a324774834127fc6c32cf236bfa1"
+size = 32904
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/leg.stl"
+git_blob_sha1 = "7da4e67dadb2df338f49ffd25855345b4a905f8f"
+size = 738884
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/yaw_roll_motion.stl"
+git_blob_sha1 = "20dd91011e74f3002fc376e248b4c5e827909a87"
+size = 290784
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/face_part.stl"
+git_blob_sha1 = "174b04a2725c71dbece506d5801f6a02b5057666"
+size = 570684
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/upper_leg_rigidity_plate.stl"
+git_blob_sha1 = "01f9fdef32d84b2f63820bb718ab07087c21d71a"
+size = 180084
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/soft_mouth_top.stl"
+git_blob_sha1 = "e224e1e951ec24990884b033d5ac63a2073e5eea"
+size = 393584
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/right_shell.stl"
+git_blob_sha1 = "4341ee67696762fefc62dd5612a5abd32aed6f40"
+size = 1048584
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/jaw_soft.stl"
+git_blob_sha1 = "70a8ee9248f65fcfa2f68bbab41e94571b26f25a"
+size = 336384
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/neck.stl"
+git_blob_sha1 = "2841d71ffd4203a30bbdba33a6a171742e20a581"
+size = 73484
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/foot_right.stl"
+git_blob_sha1 = "3d9ac8112fd60b4d787bd26a280b4d5045b8db02"
+size = 997684
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/ankle_left.stl"
+git_blob_sha1 = "2dad3b1633f4158b1262288ba73b46c7d194264d"
+size = 248984
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/trunk_base.stl"
+git_blob_sha1 = "28a703ce76b817bdf73a4fb8f8089040c2ec4510"
+size = 184984
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/bearing_roll.stl"
+git_blob_sha1 = "3e506e515c729f7d8e9c9be5c155b8489a8e0f4d"
+size = 121084
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/upper_leg_left.stl"
+git_blob_sha1 = "5b3edce01372224337cde91435e0dae70ee306d5"
+size = 612584
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/neck_pitch.stl"
+git_blob_sha1 = "d93b3d30b8c8e4bc596c96aeaa065685bb55ed45"
+size = 356084
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/noenoeil.stl"
+git_blob_sha1 = "9f498cfccddc9668dceff0c9e54d9f33d73b55cb"
+size = 49284
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/top_head_shell.stl"
+git_blob_sha1 = "7c10d0cfe279e4df0f3c7debfe95e3bf4852203f"
+size = 806084
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/pcb__raspberry_pi_zero_2_w.stl"
+git_blob_sha1 = "7c160d099d48076e91b7f9924653817f3ead069f"
+size = 1048584
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/seeed_bearing__configuration__22x16x4.stl"
+git_blob_sha1 = "1cc2a3562e9cdec8667b849817569f7dc2c7f4fb"
+size = 1048584
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/yaw2roll.stl"
+git_blob_sha1 = "50e107311bb7af52c0452e3414d03d9b34857ee8"
+size = 620284
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/m12_lens_holder.stl"
+git_blob_sha1 = "d606a064040b65af3eb9e584657226c4970f1a8a"
+size = 549684
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/speaker.stl"
+git_blob_sha1 = "16de470fcc6b2977a2898ee2e60dc43d27b056d5"
+size = 684
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/bottom_head_shell.stl"
+git_blob_sha1 = "0cc4e79f405fac5b2cd93e4ddfefeeb8ea47f0ff"
+size = 1048584
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/hip_l.stl"
+git_blob_sha1 = "6870737a6f88f62c03f22e01723b06905e2e80d7"
+size = 1048584
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/elec_rpi_robot_hat_pcb.stl"
+git_blob_sha1 = "01bc5b73d4cf968fa4136870273510cdc7787006"
+size = 942884
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/xl330.stl"
+git_blob_sha1 = "036fba0df9acdd1568d5fcb13fe68673b1abde83"
+size = 206384
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/lens.stl"
+git_blob_sha1 = "c3d0bf32879e0bacd311eb5289902d1705b1d249"
+size = 93684
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/seeed_bearing__configuration_default.stl"
+git_blob_sha1 = "71aa1ba5f5f4002dee6aa887b86ad4b64cd31356"
+size = 1048584
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/ankle_right.stl"
+git_blob_sha1 = "55f5d794697144ba425ecc4023b95e5c83aceb44"
+size = 248884
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/jaw.stl"
+git_blob_sha1 = "b8019924e79f2df088dfb503459bd1c1de7a227a"
+size = 495984
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/np_f970.stl"
+git_blob_sha1 = "d27fc27da228c3ece3f0909b95757b9c2e1e1a0f"
+size = 1048584
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/banana_pcb_locker.stl"
+git_blob_sha1 = "e431ca6236a5dd0dbdfaa508d1dd4e2b0ae4c47c"
+size = 69484
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/upper_leg_right.stl"
+git_blob_sha1 = "f1443617b1aa5ebe201cded5bf9aecab041d56bc"
+size = 612584
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/left_shell.stl"
+git_blob_sha1 = "afc336267d9b7ce2b5b309d3a762fa598cd5fa73"
+size = 1048584
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/foot_left.stl"
+git_blob_sha1 = "e0e196b5f281d9744930e7fd96b0109f06975574"
+size = 996184
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/sole_left.stl"
+git_blob_sha1 = "c15fe2f38994cbd988ebcb7a76bc6a14c49f2564"
+size = 789484
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/sole_right.stl"
+git_blob_sha1 = "6ecced133512bfc34fc02216b4902a536d53334e"
+size = 795184
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/power_support.stl"
+git_blob_sha1 = "102f0deebf9670223b13ea1756046724970cb871"
+size = 641684
+
+[[files]]
+path = "src/mjlab_microduck/robot/microduck/assets/motor_support.stl"
+git_blob_sha1 = "72289542cbb9b02f69686993f59fcf40fbe8422b"
+size = 180884
+
+[policy_source]
+repository = "https://huggingface.co/pollen-robotics/microduck-policies"
+base_url = "https://huggingface.co/pollen-robotics/microduck-policies/resolve"
+revision = "665ae4eb20bfe13bca1ef4ea6d4bb6b4a096e448"
+
+[[policy_files]]
+path = "velstand.onnx"
+size = 793705
+sha256 = "2fc7f8ee6acd7d0d3f66a99927b5d5a56589aeed02ec714de329b252d5ccf492"
