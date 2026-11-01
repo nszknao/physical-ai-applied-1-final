@@ -23,6 +23,7 @@ Python 3.12とuvを使用する。公式RLプロジェクトがPython `>=3.12,<3
 | `assets/vendor/` | 取得した公式素材。XMLとメッシュの相対配置を保持 | 対象外 |
 | `assets/scenes/` | 独自のシーン | 対象 |
 | `scripts/fetch_assets.py` | 明示的に実行する素材取得処理 | 対象 |
+| `scripts/check_vision.py` | 保存画像の推論確認・比較用シーンの撮影 | 対象 |
 | `uv.lock` | 解決した依存バージョン | 対象 |
 | `.venv/` | Python環境 | 対象外 |
 | `runs/` | 保存画像・実験設定・実行ログ | 対象外 |
@@ -43,6 +44,7 @@ Python 3.12とuvを使用する。公式RLプロジェクトがPython `>=3.12,<3
 | `perception.py` | カメラ画像から対象の位置・見え方を推定 |
 | `behavior.py` | 探索・接近・停止の判断、移動指令の生成 |
 | `runlog.py` | 設定と時系列データ・イベントの保存 |
+| `vision.py` | RGB画像からVLM推論・回答の形式検証 |
 
 物理状態の更新はシミュレーション側に集約する。行動判断側は関節を直接操作しない。
 
@@ -117,7 +119,7 @@ OpenCVのRGB→HSV変換を使用し、色相0〜10または170〜179、彩度12
 
 `annotate_detection()` は元画像をコピーし、枠・重心・検出状態を重ねる。画像取得ごとに検出し、未検出時には以前の枠を保持しない。表示用画像を次の認識入力へ戻さない。
 
-画像処理には`opencv-python` を使用する。`simulation.py` は元画像の取得、検出処理の呼び出し、保存、ビューアへの表示を担当する。表示には導入済みMuJoCoの公開API `Handle.viewport`・`set_images()`・`clear_images()` を使用し、描画領域の右下に4:3の小窓を配置する。画像は最大2倍、描画領域の幅のおよそ1/3に収まるよう拡縮する。縦反転は `set_images()` に任せ、ビューアのロック外から呼ぶ。画像の転送は新しいカメラ画像が得られた場合と描画領域が変わった場合だけ行い、ビューアの同期ごとに同じ画像を再転送しない。新たなGUIウィンドウやスレッドは作らない。
+画像処理には `opencv-python` を使用する。`simulation.py` は元画像の取得、検出処理の呼び出し、保存、ビューアへの表示を担当する。表示には導入済みMuJoCoの公開API `Handle.viewport`・`set_images()`・`clear_images()` を使用し、描画領域の右下に4:3の小窓を配置する。画像は最大2倍、描画領域の幅のおよそ1/3に収まるよう拡縮する。縦反転は `set_images()` に任せ、ビューアのロック外から呼ぶ。画像の転送は新しいカメラ画像が得られた場合と描画領域が変わった場合だけ行い、ビューアの同期ごとに同じ画像を再転送しない。新たなGUIウィンドウやスレッドは作らない。
 
 保存時は同一フレームの元画像と検出結果付き画像を別ファイルに出力する。元画像のパスに対して後者のstemへ `_detection` を付け、両方をPPM形式で保存する。
 
@@ -154,11 +156,10 @@ OpenCVのRGB→HSV変換を使用し、色相0〜10または170〜179、彩度12
 
 起動引数、コードrevisionと変更有無、Pythonソース・シーン・使用方策・lockfile・素材manifestのSHA-256、素材と方策の参照revision、Python・主要依存・OSを記録する。ランダム配置・外乱は導入していないためseedはnullとする。ハッシュは入力識別用で、未コミットのソースや入力ファイル自体を複製するものではない。
 
-
 ## 保存画像のVLM推論
 
-`vision.py` は画像の読み込み、固定revisionのQwen3-VL-4B-Instruct（MLX 4bit）のロード、逐次推論、JSON検証を担当する。モデルIDとrevision、プロンプトは同モジュールの定数にまとめる。MLX-VLMはモデル変換時と同じ0.3.4を使い、対応するTransformers 4系を依存ロックで固定する。Qwen3-VLのAutoProcessorは静止画入力でも動画用processorを初期化するため、Torchvisionとそれが要求するTorchをvision extraへ含める。これらは前処理側の依存であり、モデルの推論にはMLXを使用する。MLX関連はApple Silicon Mac用の `vision` extraとし、Metalを初期化するimportは画像推論の呼び出し時に限定する。OpenCVはMLX-VLMと同じ `opencv-python` に統一し、同じcv2を配置するheadless版との重複を避ける。
+`vision.py` の `VisionModel` はモデル・processor・整形済みプロンプトを保持するdataclassである。`load()` で固定revisionのQwen3-VL-4B-Instruct（MLX 4bit）をロードし、`analyze(rgb)` でRGB画像から推論・JSON検証を行う。ファイル入力・結果保存・CLIには依存しない。モデルIDとrevision、プロンプトは同モジュールの定数にまとめる。MLX-VLMはモデル変換時と同じ0.3.4を使い、対応するTransformers 4系を依存ロックで固定する。Qwen3-VLのAutoProcessorは静止画入力でも動画用processorを初期化するため、Torchvisionとそれが要求するTorchをvision extraへ含める。これらは前処理側の依存であり、モデルの推論にはMLXを使用する。MLX関連はApple Silicon Mac用の `vision` extraとし、Metalを初期化するimportは画像推論の呼び出し時に限定する。OpenCVはMLX-VLMと同じ `opencv-python` に統一し、同じcv2を配置するheadless版との重複を避ける。
 
-`__main__.py` は `--analyze-image` をシミュレーション作成・mjpythonへの再起動より前に分岐する。入力は保存されたRGB画像と文章のみで、MuJoCoの正解座標・物体ID・既存の色検出結果を渡さない。画像は長辺640画素以下に縮小し、MLX-VLMの画像処理へ渡す。生成はtemperature=0、最大256トークン。VLMは方向・推奨行動・理由を出力し、関節制御や移動指令の実行には関与しない。
+`__main__.py` はシミュレーションの起動だけを扱う。画像の動作確認は `scripts/check_vision.py` が担当し、画像ファイルの読み込み、モデルを共有した逐次推論、推論条件と結果の保存を行う。`--cases` はMuJoCoの初期配置を変えて4ケースを撮影する確認用オプションで、本体には配置シナリオを持ち込まない。入力は保存されたRGB画像と文章のみで、MuJoCoの正解座標・物体ID・既存の色検出結果を渡さない。画像は長辺640画素以下に縮小し、MLX-VLMの画像処理へ渡す。生成はtemperature=0、最大256トークン。VLMは方向・推奨行動・理由を出力し、関節制御や移動指令の実行には関与しない。
 
 回答は生の文字列と検証結果を両方保持する。期待するキー・列挙値・理由を検査し、不正な回答を有効な停止指令へ補正しない。推論時間は画像処理と生成を含む壁時計時間で、モデル取得・ロード時間は別項目とする。出力指定時は入力RGB画像と結果を新規ディレクトリに保存する。JSON検証は構文・スキーマの確認であり、認識精度やゴール達成の評価ではない。

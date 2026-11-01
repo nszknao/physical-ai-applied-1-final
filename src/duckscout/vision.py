@@ -1,15 +1,15 @@
-"""Inspect saved camera images with a local VLM; never issue robot commands."""
+"""Local Qwen3-VL inference on RGB images, independent of files and simulation."""
 
-import hashlib
 import json
 import platform
 import sys
-from contextlib import redirect_stdout
-from importlib.metadata import version
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
+from typing import Any
 
 import cv2
+import numpy as np
 
 MODEL_ID = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
 MODEL_REVISION = "2fd8dacbdb8f1e54b8c005f081ec5bf79c56376b"
@@ -57,106 +57,80 @@ def parse_decision(text: str) -> dict:
     return result
 
 
-def analyze_images(paths: list[Path], output: Path | None = None) -> dict:
-    """Load once, infer sequentially, and retain raw answers for human review."""
-    if not paths:
-        raise ValueError("At least one image is required")
-    if output is not None and output.exists():
-        raise FileExistsError(
-            f"Output already exists: {output}; choose a new directory"
+def prepare_image(rgb: np.ndarray) -> np.ndarray:
+    """Validate camera RGB and bound image size while preserving aspect ratio."""
+    if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3 or not rgb.size:
+        raise ValueError("Expected a nonempty uint8 RGB image")
+    height, width = rgb.shape[:2]
+    scale = min(1.0, 640 / max(width, height))
+    if scale < 1:
+        return cv2.resize(
+            rgb,
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
         )
-    images = []
-    records = []
-    # Decode before loading/downloading the model so bad paths fail promptly.
-    for path in paths:
-        content = path.read_bytes()
-        frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
-        if frame is None:
-            raise ValueError(f"Cannot decode image: {path}")
-        height, width = frame.shape[:2]
-        scale = min(1.0, 640 / max(width, height))
-        if scale < 1:
-            frame = cv2.resize(
-                frame,
-                (max(1, round(width * scale)), max(1, round(height * scale))),
-                interpolation=cv2.INTER_AREA,
-            )
-        images.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        records.append(
-            {
-                "image": str(path.resolve()),
-                "sha256": hashlib.sha256(content).hexdigest(),
-                "original_size": [width, height],
-                "input_size": [frame.shape[1], frame.shape[0]],
-            }
-        )
-    if sys.platform != "darwin" or platform.machine() != "arm64":
-        raise RuntimeError("MLX image inference requires an Apple Silicon Mac")
+    return rgb
 
-    # Optional MLX imports initialize Metal. Keep them out of viewer/help/tests.
-    try:
-        from huggingface_hub import snapshot_download
-        from mlx_vlm import generate, load
-        from mlx_vlm.prompt_utils import apply_chat_template
-        from PIL import Image
-    except ModuleNotFoundError as error:
-        raise RuntimeError(
-            "Install vision dependencies: uv sync --extra vision"
-        ) from error
-    except ImportError as error:
-        raise RuntimeError(
-            f"Cannot initialize MLX: {error} "
-            "Run image analysis in a local terminal with Metal GPU access."
-        ) from error
 
-    report = {
-        "model": MODEL_ID,
-        "revision": MODEL_REVISION,
-        "prompt": PROMPT,
-        "generation": {"max_tokens": MAX_TOKENS, "temperature": 0.0},
-        "versions": {
-            name: version(name) for name in ("mlx", "mlx-vlm", "transformers")
-        },
-        "images": [],
-    }
-    print(f"Loading {MODEL_ID} (first download: about 3 GB)...", file=sys.stderr)
-    started = perf_counter()
-    # The HF cache is keyed by the immutable revision; normal runs reuse it.
-    with redirect_stdout(sys.stderr):
-        model_path = snapshot_download(MODEL_ID, revision=MODEL_REVISION, token=False)
-        model, processor = load(model_path, trust_remote_code=False)
-        config = json.loads((Path(model_path) / "config.json").read_text())
+@dataclass
+class VisionModel:
+    """Loaded model and processor; construct with load(), reuse across frames."""
+
+    model: Any
+    processor: Any
+    prompt: str
+
+    @classmethod
+    def load(cls) -> "VisionModel":
+        if sys.platform != "darwin" or platform.machine() != "arm64":
+            raise RuntimeError("MLX image inference requires an Apple Silicon Mac")
+        # MLX initializes Metal on import. Load optional dependencies only when
+        # inference is requested, so simulation, CLI help and CPU tests still work.
+        try:
+            from huggingface_hub import snapshot_download
+            from mlx_vlm import load
+            from mlx_vlm.prompt_utils import apply_chat_template
+        except ModuleNotFoundError as error:
+            raise RuntimeError(
+                "Install vision dependencies: uv sync --extra vision"
+            ) from error
+        except ImportError as error:
+            raise RuntimeError(
+                f"Cannot initialize MLX: {error} "
+                "Run image analysis in a local terminal with Metal GPU access."
+            ) from error
+        path = snapshot_download(MODEL_ID, revision=MODEL_REVISION, token=False)
+        model, processor = load(path, trust_remote_code=False)
+        config = json.loads((Path(path) / "config.json").read_text())
         prompt = apply_chat_template(processor, config, PROMPT, num_images=1)
-    report["load_seconds"] = round(perf_counter() - started, 3)
-    if output is not None:
-        output.mkdir(parents=True, exist_ok=False)
-    for index, (rgb, record) in enumerate(zip(images, records, strict=True)):
-        print(f"Analyzing {record['image']}...", file=sys.stderr)
+        return cls(model=model, processor=processor, prompt=prompt)
+
+    def analyze(self, rgb: np.ndarray) -> dict:
+        """Return the raw answer and schema validation; never issue commands."""
+        rgb = prepare_image(rgb)
+        # As in load(), keep optional Metal/Pillow dependencies at the API boundary.
+        from mlx_vlm import generate
+        from PIL import Image
+
         started = perf_counter()
-        with redirect_stdout(sys.stderr):
-            result = generate(
-                model,
-                processor,
-                prompt,
-                image=[Image.fromarray(rgb)],
-                max_tokens=MAX_TOKENS,
-                temperature=0.0,
-                verbose=False,
-            )
-        record["inference_seconds"] = round(perf_counter() - started, 3)
-        record["raw_response"] = result.text
-        record["generation_tokens"] = result.generation_tokens
+        result = generate(
+            self.model,
+            self.processor,
+            self.prompt,
+            image=[Image.fromarray(rgb)],
+            max_tokens=MAX_TOKENS,
+            temperature=0.0,
+            verbose=False,
+        )
+        record = {
+            "inference_seconds": round(perf_counter() - started, 3),
+            "raw_response": result.text,
+            "generation_tokens": result.generation_tokens,
+        }
         try:
             record["decision"] = parse_decision(result.text)
             record["validation_error"] = None
         except ValueError as error:
             record["decision"] = None
             record["validation_error"] = str(error)
-        report["images"].append(record)
-        if output is not None:
-            # Preserve the exact RGB input alongside the answer for review.
-            Image.fromarray(rgb).save(output / f"input-{index + 1:02d}.png")
-            (output / "result.json").write_text(
-                json.dumps(report, ensure_ascii=False, indent=2) + "\n"
-            )
-    return report
+        return record

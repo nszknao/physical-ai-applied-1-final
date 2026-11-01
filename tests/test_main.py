@@ -1,13 +1,11 @@
 """Tests for duckscout.__main__: CLI validation and process launch routing."""
 
-import io
 import json
 import os
 import sys
 import sysconfig
 import tempfile
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -110,54 +108,6 @@ class ArgumentTests(unittest.TestCase):
             side_effect=AssertionError("Graphics created"),
         ):
             self.assertEqual(main(["--headless", "--steps", "2"]), 0)
-
-
-class ImageModeTests(unittest.TestCase):
-    def test_image_mode_bypasses_scene_and_viewer_and_outputs_json(self):
-        report = {"images": [{"validation_error": None}]}
-        with (
-            patch("duckscout.__main__.analyze_images", return_value=report) as analyze,
-            patch("duckscout.__main__.Simulation.from_scene") as scene,
-            patch("duckscout.__main__.ensure_viewer_process") as viewer,
-            redirect_stdout(io.StringIO()) as stdout,
-        ):
-            self.assertEqual(
-                main(["--analyze-image", "a.ppm", "b.png", "--output", "out"]), 0
-            )
-        analyze.assert_called_once_with([Path("a.ppm"), Path("b.png")], Path("out"))
-        scene.assert_not_called()
-        viewer.assert_not_called()
-        self.assertEqual(json.loads(stdout.getvalue()), report)
-
-    def test_invalid_model_answer_is_reported_with_nonzero_exit(self):
-        with (
-            patch(
-                "duckscout.__main__.analyze_images",
-                return_value={"images": [{"validation_error": "bad JSON"}]},
-            ),
-            redirect_stdout(io.StringIO()),
-        ):
-            self.assertEqual(main(["--analyze-image", "a.ppm"]), 1)
-
-    def test_simulation_options_are_rejected_even_with_default_values(self):
-        for flags in (
-            ["--policy"],
-            ["--auto"],
-            ["--headless"],
-            ["--steps", "300"],
-            ["--camera", "follow"],
-            ["--scene", "assets/scenes/search.xml"],
-            ["--keyframe", "STAND"],
-            ["--target", "0", "0"],
-            ["--snapshot", "a.ppm"],
-        ):
-            with (
-                self.subTest(flags=flags),
-                patch("duckscout.__main__.analyze_images") as analyze,
-            ):
-                with self.assertRaises(SystemExit):
-                    main(["--analyze-image", "a.ppm", *flags])
-                analyze.assert_not_called()
 
 
 if __name__ == "__main__":

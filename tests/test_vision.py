@@ -2,22 +2,17 @@
 
 import importlib.util
 import json
-import sys
-import tempfile
 import unittest
-from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
 
-import cv2
 import numpy as np
 
 from duckscout.vision import (
     MODEL_ID,
     MODEL_REVISION,
     PROMPT,
-    analyze_images,
+    VisionModel,
     parse_decision,
+    prepare_image,
 )
 
 ANSWER = {
@@ -53,71 +48,23 @@ class DecisionTests(unittest.TestCase):
                 parse_decision(json.dumps(ANSWER | replacement))
 
 
-class ImageAnalysisTests(unittest.TestCase):
-    def test_bad_input_fails_before_optional_backend_import(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "bad.png"
-            path.write_text("not an image")
-            with patch.dict(sys.modules, {"mlx_vlm": None}):
-                with self.assertRaisesRegex(ValueError, "Cannot decode"):
-                    analyze_images([path])
-                with self.assertRaises(FileNotFoundError):
-                    analyze_images([path.with_name("missing.png")])
-                with self.assertRaises(FileExistsError):
-                    analyze_images([path], Path(directory))
+class ImageInputTests(unittest.TestCase):
+    def test_resize_preserves_rgb_and_aspect_ratio(self):
+        rgb = np.zeros((480, 960, 3), dtype=np.uint8)
+        rgb[:, :, 0] = 255
+        resized = prepare_image(rgb)
+        self.assertEqual(resized.shape, (320, 640, 3))
+        np.testing.assert_array_equal(resized[0, 0], [255, 0, 0])
 
-    def test_batch_loads_once_preserves_raw_answer_and_reports_invalid_json(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            image = root / "camera.png"
-            frame = np.zeros((480, 960, 3), dtype=np.uint8)
-            frame[:, :, 2] = 255
-            cv2.imwrite(str(image), frame)
-            (root / "config.json").write_text('{"model_type": "qwen3_vl"}')
-            generate = Mock(
-                side_effect=[
-                    SimpleNamespace(text=json.dumps(ANSWER), generation_tokens=50),
-                    SimpleNamespace(text="truncated JSON {", generation_tokens=256),
-                ]
-            )
-            load = Mock(return_value=("model", "processor"))
-            snapshot = Mock(return_value=str(root))
-            pil_image = Mock()
-            pil_image.fromarray.return_value.save.side_effect = lambda path: (
-                path.write_bytes(b"PNG stub")
-            )
-            backend_modules = {
-                "huggingface_hub": SimpleNamespace(snapshot_download=snapshot),
-                "mlx_vlm": SimpleNamespace(generate=generate, load=load),
-                "mlx_vlm.prompt_utils": SimpleNamespace(
-                    apply_chat_template=Mock(return_value="prompt")
-                ),
-                "PIL": SimpleNamespace(Image=pil_image),
-            }
-            with (
-                patch.dict(sys.modules, backend_modules),
-                patch("duckscout.vision.sys.platform", "darwin"),
-                patch("duckscout.vision.platform.machine", return_value="arm64"),
-                patch("duckscout.vision.version", return_value="test"),
-            ):
-                report = analyze_images([image, image], root / "output")
-            load.assert_called_once_with(str(root), trust_remote_code=False)
-            self.assertEqual(snapshot.call_args.kwargs["revision"], MODEL_REVISION)
-            self.assertEqual(generate.call_count, 2)
-            first, second = report["images"]
-            self.assertEqual(first["decision"], ANSWER)
-            self.assertEqual(first["original_size"], [960, 480])
-            self.assertEqual(first["input_size"], [640, 320])
-            self.assertEqual(len(first["sha256"]), 64)
-            self.assertIsNone(second["decision"])
-            self.assertIsNotNone(second["validation_error"])
-            self.assertEqual(second["raw_response"], "truncated JSON {")
-            self.assertEqual(
-                json.loads((root / "output/result.json").read_text()), report
-            )
-            self.assertTrue((root / "output/input-02.png").exists())
-            rgb = pil_image.fromarray.call_args.args[0]
-            np.testing.assert_array_equal(rgb[0, 0], [255, 0, 0])
+    def test_invalid_camera_images_fail_before_backend_import(self):
+        model = VisionModel(model=None, processor=None, prompt="test")
+        for rgb in (
+            np.zeros((3, 3)),
+            np.zeros((3, 3, 4), np.uint8),
+            np.zeros((0, 3, 3), np.uint8),
+        ):
+            with self.subTest(shape=rgb.shape), self.assertRaises(ValueError):
+                model.analyze(rgb)
 
 
 @unittest.skipUnless(
