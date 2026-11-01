@@ -152,6 +152,9 @@ class Simulation:
                 vin_drop_gain=0.1,
                 vin_min=6.0,
             )
+            # BAM construction calls mj_setConst, which replaces qpos with qpos0.
+            # Restore the keyframe for unactuated objects as well as the robot.
+            mujoco.mj_resetDataKeyframe(self.model, self.data, self.key_id)
             root = self.policy.root_qpos
             self.data.qpos[root : root + 7] = (0, 0, 0.125, 1, 0, 0, 0)
             self.data.qpos[self.policy.qpos_indices] = DEFAULT_POSE

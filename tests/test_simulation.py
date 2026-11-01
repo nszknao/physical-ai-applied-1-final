@@ -748,6 +748,98 @@ class CameraPreviewTests(unittest.TestCase):
         backend.set_images.assert_not_called()
 
 
+@unittest.skipUnless(
+    SCENE.is_file() and POLICY.is_file(), "Fetch robot and policy assets first"
+)
+class PenaltySceneTests(unittest.TestCase):
+    def setUp(self):
+        self.sim = Simulation.from_scene(
+            SEARCH_SCENE.with_name("penalty.xml"), policy_path=POLICY
+        )
+        self.ball_qpos = int(self.sim.model.joint("ball_freejoint").qposadr[0])
+
+    def test_free_ball_keyframe_survives_bam_reset(self):
+        sim = self.sim
+        self.assertEqual((sim.model.nq, sim.model.nv, sim.model.nu), (28, 26, 14))
+        self.assertEqual(sim.policy.observation(sim.data).shape, (1, 61))
+        self.assertTrue((sim.policy.qpos_indices < self.ball_qpos).all())
+        initial = sim.data.qpos.copy()
+        np.testing.assert_allclose(
+            initial[self.ball_qpos : self.ball_qpos + 7], [0.7, 0, 0.04, 1, 0, 0, 0]
+        )
+        # A keyframe may differ from the XML body placement (qpos0). BAM must
+        # not silently replace a custom ball pose when rebuilding its motors.
+        sim.model.key_qpos[sim.key_id, self.ball_qpos + 1] = 0.1
+        sim.data.qvel[:] = 1
+        sim.set_command(forward=FORWARD_SPEED)
+        paused = handle_key(sim, ord("R"), False)
+        self.assertTrue(paused)
+        expected = initial.copy()
+        expected[self.ball_qpos + 1] = 0.1
+        np.testing.assert_allclose(sim.data.qpos, expected)
+        np.testing.assert_array_equal(sim.data.qvel, 0)
+        np.testing.assert_array_equal(sim.policy.command, 0)
+        sim.model.key_qpos[sim.key_id, self.ball_qpos + 1] = 0
+        sim.reset()
+        np.testing.assert_allclose(sim.data.qpos, initial)
+
+    def test_forward_walk_contacts_ball_and_sends_it_through_goal(self):
+        sim = self.sim
+        ball = sim.model.geom("ball").id
+        radius = float(sim.model.geom_size[ball, 0])
+        left = sim.model.geom("goal_left")
+        right = sim.model.geom("goal_right")
+        crossbar = sim.model.geom("goal_crossbar")
+        line_x = float(sim.model.site("goal_line").pos[0])
+        inner_left = float(left.pos[1] - left.size[0])
+        inner_right = float(right.pos[1] + right.size[0])
+        opening_height = float(crossbar.pos[2] - crossbar.size[0])
+        foot_ids = {
+            sim.model.geom("left_foot_collision").id,
+            sim.model.geom("right_foot_collision").id,
+        }
+        touched_by_foot = False
+        crossed = False
+        # 2 s standing, 10 s forward, 3 s stopped. No ball pose/velocity writes
+        # or applied forces: all displacement must come from physical contact.
+        for step in range(3000):
+            if step == 400:
+                np.testing.assert_allclose(
+                    sim.data.qpos[self.ball_qpos : self.ball_qpos + 2],
+                    [0.7, 0],
+                    atol=1e-6,
+                )
+                sim.set_command(forward=FORWARD_SPEED)
+            elif step == 2400:
+                sim.set_command()
+            previous_x = float(sim.data.qpos[self.ball_qpos])
+            sim.step()
+            for contact in sim.data.contact:
+                pair = set(contact.geom)
+                if ball in pair and pair & foot_ids:
+                    touched_by_foot = True
+            x, y, z = sim.data.qpos[self.ball_qpos : self.ball_qpos + 3]
+            # Whole ball crosses the front line inside the posts and crossbar.
+            if previous_x - radius <= line_x < x - radius:
+                self.assertTrue(touched_by_foot)
+                self.assertGreater(y - radius, inner_right)
+                self.assertLess(y + radius, inner_left)
+                self.assertLess(z + radius, opening_height)
+                crossed = True
+                print(f"Ball crossed goal at {sim.data.time:.2f}s, y={y:.3f}m")
+        self.assertTrue(touched_by_foot, "No actual foot/ball contact occurred")
+        self.assertTrue(crossed, "Ball did not cross the goal mouth")
+        self.assertEqual(sim.policy.targets(sim.data).shape, (14,))
+        self.assertGreaterEqual(sim.min_height, 0.08)
+        self.assertLess(sim.max_tilt, 45)
+        sim.reset()
+        np.testing.assert_allclose(
+            sim.data.qpos[self.ball_qpos : self.ball_qpos + 7],
+            [0.7, 0, 0.04, 1, 0, 0, 0],
+        )
+        np.testing.assert_array_equal(sim.data.qvel, 0)
+
+
 class SnapshotTests(unittest.TestCase):
     def test_ppm_preserves_rgb_order_rows_and_creates_parent_directory(self):
         rgb = np.array(
