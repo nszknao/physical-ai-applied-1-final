@@ -79,6 +79,36 @@ Spaceで開始し、約2秒立位を整えてから↑で前進します。←�
 
 モデルや追加素材の取得は不要です。ボール・ゴール・床はMuJoCoの標準形状で定義しています。
 
+## 保存画像のVLM推論（Apple Silicon Mac）
+
+[Qwen3-VL-4B-InstructのMLX 4bit版](https://huggingface.co/mlx-community/Qwen3-VL-4B-Instruct-4bit)をローカルで実行します。画像からボール・ゴールの方向と推奨行動を出力します。推奨行動は確認用で、シミュレータへ指令を送りません。
+
+```sh
+uv sync --extra vision
+uv run --extra vision python -m duckscout --policy --scene assets/scenes/penalty.xml --snapshot runs/penalty.ppm
+```
+
+ビューアでEnterを押して頭部画像を保存し、Escで終了します。次に推論します。
+
+```sh
+uv run --extra vision python -m duckscout --analyze-image runs/penalty.ppm --output runs/vision-01
+```
+
+初回は固定revisionの重みなど約3 GBをHugging Faceのキャッシュへ取得します。以降はキャッシュを再利用します。実行時には重み以外にもメモリを使い、処理時間はMacの性能に依存します。通常の `uv run` は追加依存を外す場合があるため、画像推論には毎回 `--extra vision` を付けてください。
+
+ターミナルのJSONと `runs/vision-01/result.json` に、生の回答 `raw_response`、検証済みの `decision`、推論秒数、モデルrevision、プロンプト、入力画像のSHA-256を記録します。`input-01.png` は推論に渡したRGB画像です。`--output` を省略するとターミナルへだけ出力します。既存の出力ディレクトリは上書きしません。
+
+| 出力 | 意味 |
+|---|---|
+| `ball_position` / `goal_position` | 画像を横に3等分した `left` / `center` / `right`、映っていない `not_visible`、不明 `unknown` |
+| `action` | `forward` / `turn_left` / `turn_right` / `stop` の推奨 |
+| `reason` | 推奨理由（英語） |
+| `validation_error` | JSONの形式・値の検証エラー。正常時はnull |
+
+JSONとして不正な回答は生の回答を残し、`decision` をnull、終了コードを1にします。形式の検証は画像認識の正しさを保証しません。元画像と回答を見比べてください。PNG・JPEG・PPMに対応し、長辺640画素を超える画像は縦横比を保って縮小します。検出枠付きの `_detection.ppm` ではなく、元画像を入力します。
+
+`--analyze-image a.ppm b.ppm` のように複数画像を渡すと、モデルを一度ロードして順番に推論します。画像推論と `--policy`・`--auto` などのシミュレーション用オプションは併用できません。
+
 ## 対象物と頭部カメラ
 
 既定のシーンは `assets/scenes/search.xml` です。初期位置の正面80 cmに、一辺8 cmの赤い立方体を床へ固定しています。配置は `--target X Y` で変更できます。XMLを編集する場合、長さの単位はm、`size` は各辺の半分です。物体との衝突は有効です。
@@ -200,11 +230,11 @@ uv run ruff check .
 uv run ruff format --check .
 ```
 
-`--check` はネットワークを使わず素材を検証します。`--headless` は物理更新と数値状態を確認します。`--policy` 併用時は高さ・傾きも検証します。表示やキー操作の確認は別途必要です。実方策のテストは素材取得後に実行され、ファイルがない場合はskipと表示されます。立位維持に加え、前進・左右旋回からの停止、旋回後の前進をシミュレーション時間で検証します。
+`--check` はネットワークを使わず素材を検証します。`--headless` は物理更新と数値状態を確認します。`--policy` 併用時は高さ・傾きも検証します。表示やキー操作の確認は別途必要です。VLMの実前処理テストは `uv run --extra vision python -m unittest discover -s tests -p test_vision.py -v` で実行できます。vision依存または固定revisionのモデルキャッシュがない場合、この実前処理テストはskipします。実方策のテストは素材取得後に実行され、ファイルがない場合はskipと表示されます。立位維持に加え、前進・左右旋回からの停止、旋回後の前進をシミュレーション時間で検証します。
 
 ### 検証結果
 
-- 自動テスト86件が通過。Ruffのlint・format確認も通過。
+- 自動テスト95件が通過。Ruffのlint・format確認も通過。
 - macOSのGUIで、立位・前進・旋回・停止、カメラ・検出表示、自動探索・接近・停止、実行ログを動作確認。
 - 実際のMuJoCo物理・ONNX方策と投影画像を使った統合テストで、以下の結果を確認。
 

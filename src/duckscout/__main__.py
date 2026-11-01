@@ -1,6 +1,7 @@
 """Command-line entry point for the MicroDuck viewer."""
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from duckscout.runlog import RunLog, run_metadata
 from duckscout.simulation import Simulation, run_headless, run_viewer
+from duckscout.vision import analyze_images
 
 
 def ensure_viewer_process(arguments: list[str]) -> None:
@@ -42,13 +44,20 @@ def ensure_viewer_process(arguments: list[str]) -> None:
 
 def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="MicroDuck model viewer and locomotion"
+        description="MicroDuck viewer, locomotion and image analysis",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--scene",
         type=Path,
-        default=Path("assets/scenes/search.xml"),
         help="MJCF scene path (relative to the current directory)",
+    )
+    parser.add_argument(
+        "--analyze-image",
+        type=Path,
+        nargs="+",
+        metavar="IMAGE",
+        help="Analyze saved images with local Qwen3-VL (requires --extra vision)",
     )
     parser.add_argument(
         "--auto",
@@ -65,9 +74,9 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument(
         "--output",
         type=Path,
-        help="Record settings, state and events in a new directory",
+        help="Save simulation logs or image analysis in a new directory",
     )
-    parser.add_argument("--keyframe", default="STAND", help="Initial named pose")
+    parser.add_argument("--keyframe", help="Initial named pose")
     parser.add_argument(
         "--policy",
         type=Path,
@@ -78,13 +87,10 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument(
         "--headless", action="store_true", help="Check physics without a window"
     )
-    parser.add_argument(
-        "--steps", type=int, default=300, help="Number of headless physics steps"
-    )
+    parser.add_argument("--steps", type=int, help="Number of headless physics steps")
     parser.add_argument(
         "--camera",
         choices=("follow", "head"),
-        default="follow",
         help="Initial viewer camera (default: follow)",
     )
     parser.add_argument(
@@ -94,6 +100,37 @@ def main(arguments: list[str] | None = None) -> int:
     )
     arguments = sys.argv[1:] if arguments is None else arguments
     args = parser.parse_args(arguments)
+    if args.analyze_image is not None:
+        simulation_options = (
+            "scene",
+            "keyframe",
+            "policy",
+            "target",
+            "steps",
+            "camera",
+            "snapshot",
+        )
+        if (
+            args.auto
+            or args.headless
+            or any(getattr(args, name) is not None for name in simulation_options)
+        ):
+            parser.error(
+                "--analyze-image accepts only --output, not simulation options"
+            )
+        try:
+            report = analyze_images(args.analyze_image, args.output)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            return int(any(item["validation_error"] for item in report["images"]))
+        except (ImportError, OSError, KeyError, ValueError, RuntimeError) as error:
+            print(f"duckscout: {error}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            return 130
+    args.scene = args.scene or Path("assets/scenes/search.xml")
+    args.keyframe = args.keyframe or "STAND"
+    args.camera = args.camera or "follow"
+    args.steps = 300 if args.steps is None else args.steps
     if args.auto and args.policy is None:
         parser.error("--auto requires --policy")
     if args.target is not None and not all(math.isfinite(v) for v in args.target):

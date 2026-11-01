@@ -64,7 +64,7 @@ def run_metadata(arguments: dict) -> dict:
                 "numpy",
                 "onnxruntime",
                 "better-actuator-models",
-                "opencv-python-headless",
+                "opencv-python",
             )
         },
         "random_seed": None,
