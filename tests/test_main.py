@@ -65,6 +65,79 @@ class LauncherTests(unittest.TestCase):
 
 
 class ArgumentTests(unittest.TestCase):
+    def test_vlm_requires_policy_viewer_and_no_other_automatic_controller(self):
+        for args in (
+            ["--approach", "red"],
+            ["--approach", "blue", "--policy", "--headless"],
+            ["--approach", "red", "--policy", "--soccer"],
+            ["--approach", "blue", "--policy", "--auto"],
+            ["--soccer"],
+            ["--soccer", "--policy", "--headless"],
+            ["--soccer", "--policy", "--auto"],
+            ["--vlm"],
+            ["--vlm", "--policy", "--headless"],
+            ["--vlm", "--policy", "--auto"],
+        ):
+            with (
+                self.subTest(args=args),
+                patch("duckscout.__main__.Simulation.from_scene") as load,
+            ):
+                with self.assertRaises(SystemExit):
+                    main(args)
+                load.assert_not_called()
+
+    def test_vlm_defaults_to_penalty_and_uses_the_normal_viewer_entrypoint(self):
+        with (
+            patch("duckscout.__main__.ensure_viewer_process") as launch,
+            patch("duckscout.__main__.Simulation.from_scene") as load,
+            patch("duckscout.__main__.run_viewer") as viewer,
+            patch.object(Path, "is_file", return_value=True),
+        ):
+            self.assertEqual(main(["--policy", "--vlm"]), 0)
+        self.assertEqual(load.call_args.args[0], Path("assets/scenes/penalty.xml"))
+        self.assertTrue(viewer.call_args.kwargs["vlm"])
+        launch.assert_called_once()
+
+    def test_soccer_enables_vlm_and_defaults_to_penalty(self):
+        with (
+            patch("duckscout.__main__.ensure_viewer_process"),
+            patch("duckscout.__main__.Simulation.from_scene") as load,
+            patch("duckscout.__main__.run_viewer") as viewer,
+            patch.object(Path, "is_file", return_value=True),
+        ):
+            self.assertEqual(main(["--policy", "--soccer"]), 0)
+        self.assertEqual(load.call_args.args[0], Path("assets/scenes/penalty.xml"))
+        self.assertTrue(viewer.call_args.kwargs["vlm"])
+        self.assertTrue(viewer.call_args.kwargs["soccer"])
+
+    def test_approach_uses_choice_scene_and_passes_color_to_viewer(self):
+        for color in ("red", "blue"):
+            with (
+                self.subTest(color=color),
+                patch("duckscout.__main__.ensure_viewer_process"),
+                patch("duckscout.__main__.Simulation.from_scene") as load,
+                patch("duckscout.__main__.run_viewer") as viewer,
+                patch.object(Path, "is_file", return_value=True),
+            ):
+                self.assertEqual(main(["--policy", "--approach", color]), 0)
+            self.assertEqual(load.call_args.args[0], Path("assets/scenes/choice.xml"))
+            self.assertEqual(viewer.call_args.kwargs["target_color"], color)
+            self.assertFalse(viewer.call_args.kwargs["soccer"])
+
+    def test_selected_soccer_uses_choice_and_enables_goal_evaluation(self):
+        for color in ("red", "blue"):
+            with (
+                self.subTest(color=color),
+                patch("duckscout.__main__.ensure_viewer_process"),
+                patch("duckscout.__main__.Simulation.from_scene") as load,
+                patch("duckscout.__main__.run_viewer") as viewer,
+                patch.object(Path, "is_file", return_value=True),
+            ):
+                self.assertEqual(main(["--policy", "--soccer", color]), 0)
+            self.assertEqual(load.call_args.args[0], Path("assets/scenes/choice.xml"))
+            self.assertEqual(viewer.call_args.kwargs["target_color"], color)
+            self.assertTrue(viewer.call_args.kwargs["soccer"])
+
     def test_auto_requires_policy_and_target_coordinates_must_be_finite(self):
         for arguments in (["--auto"], ["--target", "nan", "0"]):
             with self.subTest(arguments=arguments):

@@ -29,4 +29,12 @@
 
 [MuJoCo](https://github.com/google-deepmind/mujoco)を物理シミュレーションと表示に使用します。方策の推論には[ONNX Runtime](https://github.com/microsoft/onnxruntime)（MIT）、関節制御には[BAM](https://github.com/Rhoban/bam)（Apache-2.0、Marc Duclusaud & Grégoire Passault）を使用します。BAMは上流の依存ロックに合わせてrevision `62bd8ce12154340be97e06f7f41a0ca8f116d967` に固定します。Python依存は `pyproject.toml` で宣言し、解決結果を `uv.lock` に保存します。
 
-対象検出の色変換・連結領域抽出と検出結果の描画には [OpenCV](https://opencv.org/) の `opencv-python-headless` を使用します。検出のしきい値・領域選択・表示への接続は本プロジェクトで実装しています。
+対象検出の色変換・連結領域抽出と検出結果の描画には [OpenCV](https://opencv.org/) の `opencv-python` を使用します。検出のしきい値・領域選択・表示への接続は本プロジェクトで実装しています。
+
+
+## 画像理解モデル
+
+- 配布元：[mlx-community/Qwen3-VL-4B-Instruct-4bit](https://huggingface.co/mlx-community/Qwen3-VL-4B-Instruct-4bit)。固定revision：`2fd8dacbdb8f1e54b8c005f081ec5bf79c56376b`。
+- 原モデル：[Qwen/Qwen3-VL-4B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct)（Qwen）。配布モデルカードのライセンスはApache-2.0。
+- MLXコミュニティによる4bit量子化版を使用。本プロジェクトでは重みの変更・再学習を行わない。重みはGit管理せず、Hugging Faceのキャッシュへ取得する。
+- 推論：[MLX-VLM](https://github.com/Blaizzy/mlx-vlm)（MIT）と[MLX](https://github.com/ml-explore/mlx)（MIT）。画像入力用プロンプト、CLI、結果検証・保存は本プロジェクトで実装。

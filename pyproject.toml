@@ -13,7 +13,19 @@ dependencies = [
     "numpy>=2,<3",
     "onnxruntime>=1.24.4,<2",
     "better-actuator-models[mujoco]",
-    "opencv-python-headless>=4.10,<5",
+    "opencv-python>=4.10,<5",
+]
+
+[project.optional-dependencies]
+vision = [
+    "mlx-vlm==0.3.4; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.28,<0.29; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "transformers>=4.57,<5; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "huggingface-hub>=0.34,<1; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    # Transformers loads Qwen3-VL image/video processors even for still images.
+    # torchvision brings its matching torch; model inference itself uses MLX.
+    "torchvision>=0.24,<0.25; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "Pillow>=10.3,<13",
 ]
 
 [dependency-groups]

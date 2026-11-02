@@ -10,7 +10,14 @@ from unittest.mock import Mock, patch
 
 import mujoco
 import numpy as np
-from helpers import POLICY, SCENE, ProjectedCubeRenderer, fake_session, make_simulation
+from helpers import (
+    POLICY,
+    SCENE,
+    ProjectedCubeRenderer,
+    fake_session,
+    make_simulation,
+    projected_penalty_observation,
+)
 
 from duckscout.behavior import State
 from duckscout.locomotion import (
@@ -18,6 +25,7 @@ from duckscout.locomotion import (
     FORWARD_SPEED,
     TURN_SPEED,
 )
+from duckscout.penalty import GoalMonitor
 from duckscout.runlog import RunLog
 from duckscout.simulation import (
     CAMERA_HEIGHT,
@@ -32,7 +40,10 @@ from duckscout.simulation import (
     run_viewer,
     save_snapshot,
     show_camera_preview,
+    update_visual_step,
+    visual_preview,
 )
+from duckscout.visual_control import MOVE_SECONDS, STEP_KEY, VisualStep
 
 SEARCH_SCENE = Path(__file__).resolve().parents[1] / "assets/scenes/search.xml"
 
@@ -746,6 +757,508 @@ class CameraPreviewTests(unittest.TestCase):
         show_camera_preview(viewer, np.zeros((240, 320, 3), dtype=np.uint8))
         backend.clear_images.assert_called_once()
         backend.set_images.assert_not_called()
+
+
+@unittest.skipUnless(
+    SCENE.is_file() and POLICY.is_file(), "Fetch robot and policy assets first"
+)
+class PenaltySceneTests(unittest.TestCase):
+    def setUp(self):
+        self.sim = Simulation.from_scene(
+            SEARCH_SCENE.with_name("penalty.xml"), policy_path=POLICY
+        )
+        self.ball_qpos = int(self.sim.model.joint("ball_freejoint").qposadr[0])
+
+    def test_free_ball_keyframe_survives_bam_reset(self):
+        sim = self.sim
+        self.assertEqual((sim.model.nq, sim.model.nv, sim.model.nu), (28, 26, 14))
+        self.assertEqual(sim.policy.observation(sim.data).shape, (1, 61))
+        self.assertTrue((sim.policy.qpos_indices < self.ball_qpos).all())
+        initial = sim.data.qpos.copy()
+        np.testing.assert_allclose(
+            initial[self.ball_qpos : self.ball_qpos + 7], [0.7, 0, 0.04, 1, 0, 0, 0]
+        )
+        # A keyframe may differ from the XML body placement (qpos0). BAM must
+        # not silently replace a custom ball pose when rebuilding its motors.
+        sim.model.key_qpos[sim.key_id, self.ball_qpos + 1] = 0.1
+        sim.data.qvel[:] = 1
+        sim.set_command(forward=FORWARD_SPEED)
+        paused = handle_key(sim, ord("R"), False)
+        self.assertTrue(paused)
+        expected = initial.copy()
+        expected[self.ball_qpos + 1] = 0.1
+        np.testing.assert_allclose(sim.data.qpos, expected)
+        np.testing.assert_array_equal(sim.data.qvel, 0)
+        np.testing.assert_array_equal(sim.policy.command, 0)
+        sim.model.key_qpos[sim.key_id, self.ball_qpos + 1] = 0
+        sim.reset()
+        np.testing.assert_allclose(sim.data.qpos, initial)
+
+    def test_forward_walk_contacts_ball_and_sends_it_through_goal(self):
+        sim = self.sim
+        ball = sim.model.geom("ball").id
+        radius = float(sim.model.geom_size[ball, 0])
+        left = sim.model.geom("goal_left")
+        right = sim.model.geom("goal_right")
+        crossbar = sim.model.geom("goal_crossbar")
+        line_x = float(sim.model.site("goal_line").pos[0])
+        inner_left = float(left.pos[1] - left.size[0])
+        inner_right = float(right.pos[1] + right.size[0])
+        opening_height = float(crossbar.pos[2] - crossbar.size[0])
+        foot_ids = {
+            sim.model.geom("left_foot_collision").id,
+            sim.model.geom("right_foot_collision").id,
+        }
+        touched_by_foot = False
+        crossed = False
+        # 2 s standing, 10 s forward, 3 s stopped. No ball pose/velocity writes
+        # or applied forces: all displacement must come from physical contact.
+        for step in range(3000):
+            if step == 400:
+                np.testing.assert_allclose(
+                    sim.data.qpos[self.ball_qpos : self.ball_qpos + 2],
+                    [0.7, 0],
+                    atol=1e-6,
+                )
+                sim.set_command(forward=FORWARD_SPEED)
+            elif step == 2400:
+                sim.set_command()
+            previous_x = float(sim.data.qpos[self.ball_qpos])
+            sim.step()
+            for contact in sim.data.contact:
+                pair = set(contact.geom)
+                if ball in pair and pair & foot_ids:
+                    touched_by_foot = True
+            x, y, z = sim.data.qpos[self.ball_qpos : self.ball_qpos + 3]
+            # Whole ball crosses the front line inside the posts and crossbar.
+            if previous_x - radius <= line_x < x - radius:
+                self.assertTrue(touched_by_foot)
+                self.assertGreater(y - radius, inner_right)
+                self.assertLess(y + radius, inner_left)
+                self.assertLess(z + radius, opening_height)
+                crossed = True
+                print(f"Ball crossed goal at {sim.data.time:.2f}s, y={y:.3f}m")
+        self.assertTrue(touched_by_foot, "No actual foot/ball contact occurred")
+        self.assertTrue(crossed, "Ball did not cross the goal mouth")
+        self.assertEqual(sim.policy.targets(sim.data).shape, (14,))
+        self.assertGreaterEqual(sim.min_height, 0.08)
+        self.assertLess(sim.max_tilt, 45)
+        sim.reset()
+        np.testing.assert_allclose(
+            sim.data.qpos[self.ball_qpos : self.ball_qpos + 7],
+            [0.7, 0, 0.04, 1, 0, 0, 0],
+        )
+        np.testing.assert_array_equal(sim.data.qvel, 0)
+
+
+@unittest.skipUnless(
+    SCENE.is_file() and POLICY.is_file(), "Fetch robot and policy assets first"
+)
+class VisualControlIntegrationTests(unittest.TestCase):
+    def test_choice_scene_preserves_two_balls_and_resets_them(self):
+        sim = Simulation.from_scene(
+            SEARCH_SCENE.with_name("choice.xml"), policy_path=POLICY
+        )
+        self.assertEqual((sim.model.nq, sim.model.nv, sim.model.nu), (35, 32, 14))
+        for _ in range(400):
+            sim.step()
+        for color, y in (("red", 0.2), ("blue", -0.2)):
+            qpos = int(sim.model.joint(f"{color}_ball_freejoint").qposadr[0])
+            np.testing.assert_allclose(
+                sim.data.qpos[qpos : qpos + 2], [0.7, y], atol=0.001
+            )
+            sim.data.qpos[qpos] = 0.9
+        sim.reset()
+        for color, y in (("red", 0.2), ("blue", -0.2)):
+            qpos = int(sim.model.joint(f"{color}_ball_freejoint").qposadr[0])
+            np.testing.assert_allclose(sim.data.qpos[qpos : qpos + 3], [0.7, y, 0.04])
+
+    def test_step_key_does_not_toggle_native_visualization_or_geometry_groups(self):
+        native_keys = {entry[2] for entry in (*mujoco.mjVISSTRING, *mujoco.mjRNDSTRING)}
+        self.assertNotIn(chr(STEP_KEY), native_keys)
+        self.assertNotIn(chr(STEP_KEY), "012345")
+
+    def test_pending_inference_keeps_viewer_responsive_with_fewer_camera_readbacks(
+        self,
+    ):
+        sim = Simulation.from_scene(
+            SEARCH_SCENE.with_name("penalty.xml"), policy_path=POLICY
+        )
+        clock = [0.0]
+        visual = Mock(state="THINKING", result=None, error=None, action="stop")
+        visual.__enter__ = Mock(return_value=visual)
+        visual.__exit__ = Mock()
+        visual.update.return_value = None
+        visual.needs_image.side_effect = lambda now: visual.observe.call_count == 0
+        visual.status_lines.return_value = ["VLM THINKING"]
+        backend = Mock(exitrequest=0, viewport=mujoco.MjrRect(0, 0, 800, 600))
+        backend.lock.return_value = nullcontext()
+        viewer = mujoco.viewer.Handle(
+            backend, mujoco.MjvCamera(), mujoco.MjvOption(), mujoco.MjvPerturb(), None
+        )
+
+        def launch(*args, key_callback):
+            key_callback(32)
+            return viewer
+
+        def sync(_):
+            if sim.data.time >= 2.0:
+                backend.exitrequest = 1
+
+        backend.sync.side_effect = sync
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            RunLog(output=Path(directory) / "run", metadata={}) as log,
+            patch("duckscout.simulation.VisualStep", return_value=visual),
+            patch(
+                "duckscout.simulation.mujoco.viewer.launch_passive", side_effect=launch
+            ),
+            patch("duckscout.simulation.mujoco.Renderer") as renderer,
+            patch("duckscout.simulation.time.monotonic", side_effect=lambda: clock[0]),
+            patch(
+                "duckscout.simulation.time.sleep",
+                side_effect=lambda seconds: clock.__setitem__(
+                    0, clock[0] + max(seconds, 0.001)
+                ),
+            ),
+        ):
+            render = renderer.return_value.__enter__.return_value.render
+            render.return_value = np.zeros((240, 320, 3), np.uint8)
+            run_viewer(sim, vlm=True, log=log)
+            np.testing.assert_array_equal(visual.observe.call_args.args[0], 0)
+            saved = log.output / "vision/0001.ppm"
+            self.assertEqual(
+                saved.read_bytes(), b"P6\n320 240\n255\n" + bytes(320 * 240 * 3)
+            )
+            records = [
+                json.loads(line)
+                for line in (log.output / "records.jsonl").read_text().splitlines()
+            ]
+            capture = next(
+                record
+                for record in records
+                if record.get("event") == "vision_observation"
+            )
+            self.assertEqual(capture["image"], "vision/0001.ppm")
+            self.assertEqual(capture["time_s"], visual.observe.call_args.args[1])
+        self.assertLessEqual(render.call_count, 6)
+        self.assertGreater(backend.sync.call_count, 60)
+        self.assertGreaterEqual(sim.step_count, 400)
+        np.testing.assert_array_equal(sim.policy.command, 0)
+
+    def test_bounded_command_runs_real_physics_then_returns_to_balance(self):
+        sim = Simulation.from_scene(
+            SEARCH_SCENE.with_name("penalty.xml"), policy_path=POLICY
+        )
+        # The perception answer is fixed; physics, ONNX walking and BAM are real.
+        observation = {
+            "ball_position": "center",
+            "goal_position": "center",
+            "ball_inside_image": True,
+        }
+        model = Mock()
+        model.analyze.return_value = {
+            "observation": observation,
+            "validation_error": None,
+            "inference_seconds": 4.0,
+        }
+        log = Mock()
+        with VisualStep(loader=lambda: model) as control:
+            control._future.result(timeout=3)
+            update_visual_step(sim, control, log)
+            self.assertTrue(control.request(0))
+            for _ in range(400):
+                sim.step()
+            control.observe(np.zeros((240, 320, 3), np.uint8), sim.data.time)
+            control._future.result(timeout=3)
+            start_xy = sim.data.qpos[:2].copy()
+            moving_steps = 0
+            for _ in range(round((MOVE_SECONDS + 2) / sim.model.opt.timestep)):
+                update_visual_step(sim, control, log)
+                moving_steps += int(sim.policy.command[0] > 0)
+                sim.step()
+            self.assertEqual(moving_steps, round(MOVE_SECONDS / sim.model.opt.timestep))
+            np.testing.assert_array_equal(sim.policy.command, 0)
+            self.assertEqual(control.state, "READY")
+            # A command pulse is insufficient evidence: displacement must remain
+            # after deceleration, not just a lean that returns to the same place.
+            self.assertGreater(sim.data.qpos[0] - start_xy[0], 0.04)
+            self.assertLess(sim.data.qpos[0] - start_xy[0], 0.15)
+            self.assertLess(abs(sim.data.qpos[1] - start_xy[1]), 0.03)
+            self.assertGreaterEqual(sim.min_height, 0.08)
+            self.assertLess(sim.max_tilt, 45)
+            self.assertTrue(
+                any(
+                    call.kwargs.get("action") == "forward"
+                    for call in log.write.call_args_list
+                )
+            )
+
+    def test_automatic_contact_goal_and_stop_with_projected_observations(self):
+        # Inference is a test double. Real camera/VLM correctness is a separate
+        # manual check; this covers state integration, contacts, scoring and braking.
+        for inference_seconds in (3.0, 6.6, 10.0):
+            with self.subTest(inference_seconds=inference_seconds):
+                sim = Simulation.from_scene(
+                    SEARCH_SCENE.with_name("penalty.xml"), policy_path=POLICY
+                )
+                goal = GoalMonitor(model=sim.model)
+                model = Mock()
+                states = set()
+                foot_ids = {
+                    sim.model.geom(name).id
+                    for name in ("left_foot_collision", "right_foot_collision")
+                }
+                ball_id = sim.model.geom("ball").id
+                touched = False
+                with VisualStep(automatic=True, loader=lambda: model) as control:
+                    control._future.result(timeout=3)
+                    update_visual_step(sim, control, None, goal)
+                    self.assertTrue(control.request(0))
+                    while sim.data.time < 90:
+                        update_visual_step(sim, control, None, goal)
+                        states.add(control.state)
+                        if control.needs_image(sim.data.time):
+                            model.analyze.return_value = {
+                                "observation": projected_penalty_observation(sim),
+                                "validation_error": None,
+                                "inference_seconds": inference_seconds,
+                            }
+                            control.observe(
+                                np.zeros((2, 2, 3), np.uint8), sim.data.time
+                            )
+                            for _ in range(
+                                round(inference_seconds / sim.model.opt.timestep)
+                            ):
+                                sim.step()
+                            control._future.result(timeout=3)
+                        sim.step()
+                        for contact in sim.data.contact:
+                            pair = set(contact.geom)
+                            touched |= ball_id in pair and bool(pair & foot_ids)
+                        if control.state in ("GOAL", "STOPPED", "ERROR"):
+                            break
+                    self.assertEqual(control.state, "GOAL")
+                    self.assertTrue(touched)
+                    self.assertIn("PUSHING", states)
+                    np.testing.assert_array_equal(sim.policy.command, 0)
+                    for _ in range(400):
+                        update_visual_step(sim, control, None, goal)
+                        sim.step()
+                    self.assertEqual(control.state, "GOAL")
+                    self.assertLess(np.linalg.norm(sim.data.qvel[:2]), 0.03)
+                    self.assertLess(sim.max_tilt, 45)
+                    self.assertGreater(sim.min_height, 0.08)
+
+    def test_selected_color_contact_goal_and_stop_with_projected_observations(self):
+        # Projection is a perception fixture, not evidence of VLM accuracy.
+        for color in ("red", "blue"):
+            with self.subTest(color=color):
+                sim = Simulation.from_scene(
+                    SEARCH_SCENE.with_name("choice.xml"), policy_path=POLICY
+                )
+                goal = GoalMonitor(model=sim.model, ball_name=f"{color}_ball")
+                other = GoalMonitor(
+                    model=sim.model,
+                    ball_name="blue_ball" if color == "red" else "red_ball",
+                )
+                other_xy = sim.data.qpos[other.ball_qpos : other.ball_qpos + 2].copy()
+                model = Mock()
+                touched = False
+                ball_id = sim.model.geom(f"{color}_ball").id
+                feet = {
+                    sim.model.geom(name).id
+                    for name in ("left_foot_collision", "right_foot_collision")
+                }
+                with VisualStep(
+                    automatic=True, target_color=color, loader=lambda: model
+                ) as control:
+                    control._future.result(timeout=3)
+                    update_visual_step(sim, control, None, goal, other)
+                    control.request(0)
+                    while sim.data.time < 100:
+                        update_visual_step(sim, control, None, goal, other)
+                        if control.needs_image(sim.data.time):
+                            model.analyze.return_value = {
+                                "observation": projected_penalty_observation(
+                                    sim, f"{color}_ball"
+                                ),
+                                "validation_error": None,
+                                "inference_seconds": 4.5,
+                            }
+                            control.observe(
+                                np.zeros((2, 2, 3), np.uint8), sim.data.time
+                            )
+                            for _ in range(900):
+                                sim.step()
+                            control._future.result(timeout=3)
+                        sim.step()
+                        for contact in sim.data.contact:
+                            pair = set(contact.geom)
+                            touched |= ball_id in pair and bool(pair & feet)
+                        if control.state in ("GOAL", "MISSED", "STOPPED", "ERROR"):
+                            break
+                    self.assertEqual(control.state, "GOAL")
+                    self.assertTrue(touched)
+                    self.assertTrue(goal.scored)
+                    self.assertFalse(other.scored)
+                    for _ in range(400):
+                        update_visual_step(sim, control, None, goal, other)
+                        sim.step()
+                    np.testing.assert_array_equal(sim.policy.command, 0)
+                    np.testing.assert_allclose(
+                        sim.data.qpos[other.ball_qpos : other.ball_qpos + 2],
+                        other_xy,
+                        atol=0.001,
+                    )
+                    self.assertLess(np.linalg.norm(sim.data.qvel[:2]), 0.03)
+                    self.assertLess(sim.max_tilt, 45)
+
+    def test_wrong_ball_goal_stops_without_crediting_requested_ball(self):
+        sim = Simulation.from_scene(
+            SEARCH_SCENE.with_name("choice.xml"), policy_path=POLICY
+        )
+        target = GoalMonitor(model=sim.model, ball_name="blue_ball")
+        other = GoalMonitor(model=sim.model, ball_name="red_ball")
+        model = Mock()
+        with VisualStep(
+            automatic=True, target_color="blue", loader=lambda: model
+        ) as control:
+            control._future.result(timeout=3)
+            update_visual_step(sim, control, None, target, other)
+            control.request(0)
+            # Only the evaluation test moves a ball directly to exercise crossing.
+            sim.data.qpos[other.ball_qpos] = 1.05
+            sim.data.qpos[other.ball_qpos + 1] = 0
+            update_visual_step(sim, control, None, target, other)
+            self.assertEqual(control.state, "MISSED")
+            self.assertFalse(target.scored)
+            self.assertTrue(other.scored)
+            np.testing.assert_array_equal(sim.policy.command, 0)
+            update_visual_step(sim, control, None, target, other)
+            self.assertEqual(control.state, "MISSED")
+
+    def test_selected_ball_approach_stops_without_contact_in_real_physics(self):
+        for color in ("red", "blue"):
+            with self.subTest(color=color):
+                sim = Simulation.from_scene(
+                    SEARCH_SCENE.with_name("choice.xml"), policy_path=POLICY
+                )
+                model = Mock()
+                states = set()
+                with VisualStep(
+                    automatic=True,
+                    target_color=color,
+                    stop_before_push=True,
+                    loader=lambda: model,
+                ) as control:
+                    control._future.result(timeout=3)
+                    update_visual_step(sim, control, None)
+                    control.request(0)
+                    while sim.data.time < 100:
+                        update_visual_step(sim, control, None)
+                        states.add(control.state)
+                        if control.needs_image(sim.data.time):
+                            model.analyze.return_value = {
+                                "observation": projected_penalty_observation(
+                                    sim, color + "_ball"
+                                ),
+                                "validation_error": None,
+                                "inference_seconds": 4.5,
+                            }
+                            control.observe(
+                                np.zeros((2, 2, 3), np.uint8), sim.data.time
+                            )
+                            for _ in range(900):
+                                sim.step()
+                            control._future.result(timeout=3)
+                        sim.step()
+                        if control.state in ("NEAR", "STOPPED", "ERROR"):
+                            break
+                    self.assertEqual(control.state, "NEAR")
+                    self.assertNotIn("PUSHING", states)
+                    for _ in range(400):
+                        sim.step()
+                    np.testing.assert_array_equal(sim.policy.command, 0)
+                    self.assertGreater(sim.data.qpos[0], 0.2)
+                    self.assertGreater(
+                        sim.data.qpos[1] * (1 if color == "red" else -1), 0.03
+                    )
+                    for ball, y in (("red", 0.2), ("blue", -0.2)):
+                        q = int(sim.model.joint(f"{ball}_ball_freejoint").qposadr[0])
+                        np.testing.assert_allclose(
+                            sim.data.qpos[q : q + 2], [0.7, y], atol=0.001
+                        )
+                    self.assertLess(np.linalg.norm(sim.data.qvel[:2]), 0.03)
+                    self.assertLess(sim.max_tilt, 45)
+                    self.assertTrue(
+                        all(
+                            call.kwargs["target_color"] == color
+                            for call in model.analyze.call_args_list
+                        )
+                    )
+
+    def test_preview_does_not_modify_observation_pixels(self):
+        rgb = np.full((240, 320, 3), 127, np.uint8)
+        control = Mock()
+        control.status_lines.return_value = ["VLM THINKING 3.2s", "N: one step"]
+        preview = visual_preview(rgb, control, False)
+        np.testing.assert_array_equal(rgb, 127)
+        self.assertFalse(np.array_equal(rgb, preview))
+
+    def test_viewer_cancels_before_manual_keys_and_rejects_step_while_paused(self):
+        sim = Simulation.from_scene(
+            SEARCH_SCENE.with_name("penalty.xml"), policy_path=POLICY
+        )
+        backend = Mock(exitrequest=0, viewport=mujoco.MjrRect(0, 0, 800, 600))
+        backend.lock.return_value = nullcontext()
+        viewer = mujoco.viewer.Handle(
+            backend, mujoco.MjvCamera(), mujoco.MjvOption(), mujoco.MjvPerturb(), None
+        )
+        callbacks = []
+        visual = Mock(state="READY", result=None, error=None, action="stop")
+        visual.__enter__ = Mock(return_value=visual)
+        visual.__exit__ = Mock()
+        visual.update.return_value = None
+        visual.needs_image.return_value = False
+        visual.request.return_value = True
+        visual.status_lines.return_value = ["VLM READY"]
+
+        def launch(*args, key_callback):
+            callbacks.append(key_callback)
+            key_callback(STEP_KEY)  # Ignored while initially paused.
+            return viewer
+
+        def sync(_):
+            if backend.sync.call_count == 1:
+                callbacks[0](32)
+                callbacks[0](STEP_KEY)
+            elif backend.sync.call_count == 2:
+                callbacks[0](265)  # Manual forward cancels before setting its command.
+            elif backend.sync.call_count == 3:
+                self.assertEqual(sim.policy.command[0], FORWARD_SPEED)
+                callbacks[0](ord("R"))
+            else:
+                np.testing.assert_array_equal(sim.policy.command, 0)
+                backend.exitrequest = 1
+
+        backend.sync.side_effect = sync
+        with (
+            patch("duckscout.simulation.VisualStep", return_value=visual),
+            patch(
+                "duckscout.simulation.mujoco.viewer.launch_passive", side_effect=launch
+            ),
+            patch("duckscout.simulation.mujoco.Renderer") as renderer,
+            patch("duckscout.simulation.time.sleep"),
+            patch("duckscout.simulation.time.monotonic", side_effect=count(1, 0.02)),
+        ):
+            renderer.return_value.__enter__.return_value.render.return_value = np.zeros(
+                (240, 320, 3), np.uint8
+            )
+            run_viewer(sim, vlm=True)
+        visual.request.assert_called_once()
+        self.assertEqual(visual.cancel.call_count, 3)
+        visual.__exit__.assert_called_once()
 
 
 class SnapshotTests(unittest.TestCase):

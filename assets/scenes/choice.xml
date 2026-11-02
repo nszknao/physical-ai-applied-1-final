@@ -1,0 +1,55 @@
+<mujoco model="duckscout_choice">
+  <!-- Wider head view keeps a near ball visible during the final alignment. -->
+  <default><camera fovy="60"/></default>
+  <include file="../vendor/microduck_rl/src/mjlab_microduck/robot/microduck/robot_groundcontact.xml"/>
+  <compiler meshdir="../vendor/microduck_rl/src/mjlab_microduck/robot/microduck/assets"/>
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+  </visual>
+  <worldbody>
+    <light pos="0 0 3.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" type="plane" size="0 0 0.05" rgba="0.16 0.32 0.23 1"/>
+    <!-- Fixed overview, selectable in the viewer's Rendering > Camera menu. -->
+    <camera name="field_camera" pos="0.5 -1.8 1.1" xyaxes="1 0 0 0 0.5 0.8660254" fovy="45"/>
+
+    <!-- Free ball: diameter 8 cm, mass 30 g. No actuator or scripted forces. -->
+    <body name="red_ball" pos="0.7 0.2 0.04">
+      <freejoint name="red_ball_freejoint"/>
+      <geom name="red_ball" type="sphere" size="0.04" mass="0.03"
+            rgba="1 0.15 0.02 1" condim="6" priority="1"
+            friction="0.5 0.005 0.0002"/>
+    </body>
+
+    <body name="blue_ball" pos="0.7 -0.2 0.04">
+      <freejoint name="blue_ball_freejoint"/>
+      <geom name="blue_ball" type="sphere" size="0.04" mass="0.03"
+            rgba="0.02 0.15 1 1" condim="6" priority="1"
+            friction="0.5 0.005 0.0002"/>
+    </body>
+
+    <!-- Goal opening: 90 cm wide, 24 cm high; front line at x = 1 m. -->
+    <geom name="goal_left" type="capsule" fromto="1 0.465 0 1 0.465 0.255"
+          size="0.015" rgba="0.95 0.95 0.95 1"/>
+    <geom name="goal_right" type="capsule" fromto="1 -0.465 0 1 -0.465 0.255"
+          size="0.015" rgba="0.95 0.95 0.95 1"/>
+    <geom name="goal_crossbar" type="capsule" fromto="1 -0.465 0.255 1 0.465 0.255"
+          size="0.015" rgba="0.95 0.95 0.95 1"/>
+    <!-- Floor markings are visual only and cannot deflect the ball or feet. -->
+    <site name="goal_line" type="box" pos="1 0 0.001" size="0.008 0.45 0.001"
+          rgba="1 1 1 1"/>
+    <site name="goal_area" type="box" pos="1.15 0 0.0005" size="0.15 0.45 0.0005"
+          rgba="0.25 0.4 0.28 0.5"/>
+  </worldbody>
+  <keyframe>
+    <!-- Robot root (7), robot hinges (14), red and blue ball position/quaternion (7 each).
+         Include both balls explicitly so R restores it above the floor. -->
+    <key name="STAND" qpos="
+      0 0 0.125 1 0 0 0
+      0 -0.0873 -0.4579 -0.0049 0.4530 0.3491 0.3491 0 0
+      0 0.0873 0.4579 0.0049 -0.4530
+      0.7 0.2 0.04 1 0 0 0
+      0.7 -0.2 0.04 1 0 0 0"
+      ctrl="0 -0.0873 -0.4579 -0.0049 0.4530 0.3491 0.3491 0 0
+            0 0.0873 0.4579 0.0049 -0.4530"/>
+  </keyframe>
+</mujoco>
