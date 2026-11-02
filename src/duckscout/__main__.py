@@ -47,8 +47,12 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument(
         "--scene",
         type=Path,
-        default=Path("assets/scenes/search.xml"),
         help="MJCF scene path (relative to the current directory)",
+    )
+    parser.add_argument(
+        "--vlm",
+        action="store_true",
+        help="8: one VLM observation and short motion (requires --policy)",
     )
     parser.add_argument(
         "--auto",
@@ -94,6 +98,13 @@ def main(arguments: list[str] | None = None) -> int:
     )
     arguments = sys.argv[1:] if arguments is None else arguments
     args = parser.parse_args(arguments)
+    args.scene = args.scene or Path(
+        "assets/scenes/penalty.xml" if args.vlm else "assets/scenes/search.xml"
+    )
+    if args.vlm and (args.policy is None or args.auto or args.headless):
+        parser.error(
+            "--vlm requires --policy and a viewer; cannot combine with --auto or --headless"
+        )
     if args.auto and args.policy is None:
         parser.error("--auto requires --policy")
     if args.target is not None and not all(math.isfinite(v) for v in args.target):
@@ -140,6 +151,7 @@ def main(arguments: list[str] | None = None) -> int:
                 run_viewer(
                     simulation,
                     camera=args.camera,
+                    vlm=args.vlm,
                     snapshot=args.snapshot or Path("runs/head_camera.ppm"),
                     auto=args.auto,
                     log=log,

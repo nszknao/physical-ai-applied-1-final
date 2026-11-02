@@ -11,41 +11,41 @@ from duckscout.vision import (
     MODEL_REVISION,
     PROMPT,
     VisionModel,
-    parse_decision,
+    parse_observation,
     prepare_image,
 )
 
 ANSWER = {
     "ball_position": "center",
     "goal_position": "center",
-    "action": "forward",
-    "reason": "Both are centered.",
+    "ball_fully_visible": True,
 }
 
 
-class DecisionTests(unittest.TestCase):
+class ObservationTests(unittest.TestCase):
     def test_plain_and_fenced_json(self):
         text = json.dumps(ANSWER)
         for raw in (text, f"```json\n{text}\n```", f"```\n{text}\n```"):
             with self.subTest(raw=raw):
-                self.assertEqual(parse_decision(raw), ANSWER)
+                self.assertEqual(parse_observation(raw), ANSWER)
 
     def test_rejects_incomplete_or_unstructured_responses(self):
         for raw in ("", "I would move forward", "{}", "[]", "null", '{"action":'):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
-                parse_decision(raw)
+                parse_observation(raw)
 
-    def test_rejects_unknown_fields_enums_and_empty_reason(self):
+    def test_rejects_unknown_fields_enums_and_non_boolean_visibility(self):
         for replacement in (
             {"action": "kick"},
             {"ball_position": None},
             {"goal_position": []},
-            {"reason": "  "},
-            {"reason": 42},
+            {"ball_fully_visible": "true"},
+            {"ball_fully_visible": 1},
             {"confidence": 1.0},
+            {"ball_position": "not_visible", "ball_fully_visible": True},
         ):
             with self.subTest(replacement=replacement), self.assertRaises(ValueError):
-                parse_decision(json.dumps(ANSWER | replacement))
+                parse_observation(json.dumps(ANSWER | replacement))
 
 
 class ImageInputTests(unittest.TestCase):

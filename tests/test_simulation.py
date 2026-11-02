@@ -32,7 +32,10 @@ from duckscout.simulation import (
     run_viewer,
     save_snapshot,
     show_camera_preview,
+    update_visual_step,
+    visual_preview,
 )
+from duckscout.visual_control import MOVE_SECONDS, STEP_KEY, VisualStep
 
 SEARCH_SCENE = Path(__file__).resolve().parents[1] / "assets/scenes/search.xml"
 
@@ -838,6 +841,176 @@ class PenaltySceneTests(unittest.TestCase):
             [0.7, 0, 0.04, 1, 0, 0, 0],
         )
         np.testing.assert_array_equal(sim.data.qvel, 0)
+
+
+@unittest.skipUnless(
+    SCENE.is_file() and POLICY.is_file(), "Fetch robot and policy assets first"
+)
+class VisualControlIntegrationTests(unittest.TestCase):
+    def test_step_key_does_not_toggle_native_visualization_or_geometry_groups(self):
+        native_keys = {entry[2] for entry in (*mujoco.mjVISSTRING, *mujoco.mjRNDSTRING)}
+        self.assertNotIn(chr(STEP_KEY), native_keys)
+        self.assertNotIn(chr(STEP_KEY), "012345")
+
+    def test_pending_inference_keeps_viewer_responsive_with_fewer_camera_readbacks(
+        self,
+    ):
+        sim = Simulation.from_scene(
+            SEARCH_SCENE.with_name("penalty.xml"), policy_path=POLICY
+        )
+        clock = [0.0]
+        visual = Mock(state="THINKING", result=None, error=None, action="stop")
+        visual.__enter__ = Mock(return_value=visual)
+        visual.__exit__ = Mock()
+        visual.update.return_value = None
+        visual.needs_image.return_value = False
+        visual.status_lines.return_value = ["VLM THINKING"]
+        backend = Mock(exitrequest=0, viewport=mujoco.MjrRect(0, 0, 800, 600))
+        backend.lock.return_value = nullcontext()
+        viewer = mujoco.viewer.Handle(
+            backend, mujoco.MjvCamera(), mujoco.MjvOption(), mujoco.MjvPerturb(), None
+        )
+
+        def launch(*args, key_callback):
+            key_callback(32)
+            return viewer
+
+        def sync(_):
+            if sim.data.time >= 2.0:
+                backend.exitrequest = 1
+
+        backend.sync.side_effect = sync
+        with (
+            patch("duckscout.simulation.VisualStep", return_value=visual),
+            patch(
+                "duckscout.simulation.mujoco.viewer.launch_passive", side_effect=launch
+            ),
+            patch("duckscout.simulation.mujoco.Renderer") as renderer,
+            patch("duckscout.simulation.time.monotonic", side_effect=lambda: clock[0]),
+            patch(
+                "duckscout.simulation.time.sleep",
+                side_effect=lambda seconds: clock.__setitem__(
+                    0, clock[0] + max(seconds, 0.001)
+                ),
+            ),
+        ):
+            render = renderer.return_value.__enter__.return_value.render
+            render.return_value = np.zeros((240, 320, 3), np.uint8)
+            run_viewer(sim, vlm=True)
+        self.assertLessEqual(render.call_count, 6)
+        self.assertGreater(backend.sync.call_count, 60)
+        self.assertGreaterEqual(sim.step_count, 400)
+        np.testing.assert_array_equal(sim.policy.command, 0)
+
+    def test_bounded_command_runs_real_physics_then_returns_to_balance(self):
+        sim = Simulation.from_scene(
+            SEARCH_SCENE.with_name("penalty.xml"), policy_path=POLICY
+        )
+        # The perception answer is fixed; physics, ONNX walking and BAM are real.
+        observation = {
+            "ball_position": "center",
+            "goal_position": "center",
+            "ball_fully_visible": True,
+        }
+        model = Mock()
+        model.analyze.return_value = {
+            "observation": observation,
+            "validation_error": None,
+            "inference_seconds": 4.0,
+        }
+        log = Mock()
+        with VisualStep(loader=lambda: model) as control:
+            control._future.result(timeout=3)
+            update_visual_step(sim, control, log)
+            self.assertTrue(control.request(0))
+            for _ in range(400):
+                sim.step()
+            control.observe(np.zeros((240, 320, 3), np.uint8), sim.data.time)
+            control._future.result(timeout=3)
+            start_xy = sim.data.qpos[:2].copy()
+            moving_steps = 0
+            for _ in range(round((MOVE_SECONDS + 2) / sim.model.opt.timestep)):
+                update_visual_step(sim, control, log)
+                moving_steps += int(sim.policy.command[0] > 0)
+                sim.step()
+            self.assertEqual(moving_steps, round(MOVE_SECONDS / sim.model.opt.timestep))
+            np.testing.assert_array_equal(sim.policy.command, 0)
+            self.assertEqual(control.state, "READY")
+            # A command pulse is insufficient evidence: displacement must remain
+            # after deceleration, not just a lean that returns to the same place.
+            self.assertGreater(sim.data.qpos[0] - start_xy[0], 0.04)
+            self.assertLess(sim.data.qpos[0] - start_xy[0], 0.15)
+            self.assertLess(abs(sim.data.qpos[1] - start_xy[1]), 0.03)
+            self.assertGreaterEqual(sim.min_height, 0.08)
+            self.assertLess(sim.max_tilt, 45)
+            self.assertTrue(
+                any(
+                    call.kwargs.get("action") == "forward"
+                    for call in log.write.call_args_list
+                )
+            )
+
+    def test_preview_does_not_modify_observation_pixels(self):
+        rgb = np.full((240, 320, 3), 127, np.uint8)
+        control = Mock()
+        control.status_lines.return_value = ["VLM THINKING 3.2s", "N: one step"]
+        preview = visual_preview(rgb, control, False)
+        np.testing.assert_array_equal(rgb, 127)
+        self.assertFalse(np.array_equal(rgb, preview))
+
+    def test_viewer_cancels_before_manual_keys_and_rejects_step_while_paused(self):
+        sim = Simulation.from_scene(
+            SEARCH_SCENE.with_name("penalty.xml"), policy_path=POLICY
+        )
+        backend = Mock(exitrequest=0, viewport=mujoco.MjrRect(0, 0, 800, 600))
+        backend.lock.return_value = nullcontext()
+        viewer = mujoco.viewer.Handle(
+            backend, mujoco.MjvCamera(), mujoco.MjvOption(), mujoco.MjvPerturb(), None
+        )
+        callbacks = []
+        visual = Mock(state="READY", result=None, error=None, action="stop")
+        visual.__enter__ = Mock(return_value=visual)
+        visual.__exit__ = Mock()
+        visual.update.return_value = None
+        visual.needs_image.return_value = False
+        visual.request.return_value = True
+        visual.status_lines.return_value = ["VLM READY"]
+
+        def launch(*args, key_callback):
+            callbacks.append(key_callback)
+            key_callback(STEP_KEY)  # Ignored while initially paused.
+            return viewer
+
+        def sync(_):
+            if backend.sync.call_count == 1:
+                callbacks[0](32)
+                callbacks[0](STEP_KEY)
+            elif backend.sync.call_count == 2:
+                callbacks[0](265)  # Manual forward cancels before setting its command.
+            elif backend.sync.call_count == 3:
+                self.assertEqual(sim.policy.command[0], FORWARD_SPEED)
+                callbacks[0](ord("R"))
+            else:
+                np.testing.assert_array_equal(sim.policy.command, 0)
+                backend.exitrequest = 1
+
+        backend.sync.side_effect = sync
+        with (
+            patch("duckscout.simulation.VisualStep", return_value=visual),
+            patch(
+                "duckscout.simulation.mujoco.viewer.launch_passive", side_effect=launch
+            ),
+            patch("duckscout.simulation.mujoco.Renderer") as renderer,
+            patch("duckscout.simulation.time.sleep"),
+            patch("duckscout.simulation.time.monotonic", side_effect=count(1, 0.02)),
+        ):
+            renderer.return_value.__enter__.return_value.render.return_value = np.zeros(
+                (240, 320, 3), np.uint8
+            )
+            run_viewer(sim, vlm=True)
+        visual.request.assert_called_once()
+        self.assertEqual(visual.cancel.call_count, 3)
+        visual.__exit__.assert_called_once()
 
 
 class SnapshotTests(unittest.TestCase):

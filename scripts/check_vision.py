@@ -21,6 +21,7 @@ from duckscout.vision import (
     VisionModel,
     prepare_image,
 )
+from duckscout.visual_control import choose_action
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -100,6 +101,7 @@ def analyze_images(paths: list[Path], output: Path | None = None) -> dict:
         print(f"Analyzing {record['image']}...", file=sys.stderr)
         with redirect_stdout(sys.stderr):
             record.update(vision.analyze(rgb))
+        record["action"] = choose_action(record["observation"])
         report["images"].append(record)
         if output is not None:
             path = output / f"input-{index + 1:02d}.png"

@@ -26,6 +26,8 @@ from duckscout.locomotion import (
 )
 from duckscout.perception import annotate_detection, detect_target, estimate_distance
 from duckscout.runlog import RunLog
+from duckscout.vision import MAX_TOKENS, MODEL_ID, MODEL_REVISION, PROMPT
+from duckscout.visual_control import COMMANDS, MOVE_SECONDS, STEP_KEY, VisualStep
 
 # Flat-floor posture limits, independent of distance traveled.
 MIN_UPRIGHT_HEIGHT = 0.08
@@ -35,6 +37,7 @@ CAMERA_WIDTH = 320
 CAMERA_HEIGHT = 240
 LOG_PERIOD = 0.1  # シミュレーション秒。カメラの有無とは独立した記録周期。
 CAMERA_PERIOD = 0.1  # Simulation seconds; independent of the viewer refresh rate.
+VLM_CAMERA_PERIOD = 0.5  # Reduce GPU readbacks while MLX is loading/generating.
 
 
 def configure_bam(spec: mujoco.MjSpec) -> BamModel:
@@ -465,14 +468,67 @@ def show_camera_preview(viewer: mujoco.viewer.Handle, image: np.ndarray) -> None
     viewer.set_images((rect, preview))
 
 
+def update_visual_step(
+    simulation: Simulation, visual: VisualStep, log: RunLog | None
+) -> None:
+    """Only the physics thread applies commands and writes logs."""
+    previous_state, previous_result = visual.state, visual.result
+    command = visual.update(float(simulation.data.time))
+    if command is not None:
+        simulation.set_command(forward=command[0], yaw_rate=command[1])
+    if visual.state != previous_state or visual.result is not previous_result:
+        print(
+            f"VLM: {visual.state} | {visual.action}"
+            + (f" | {visual.error}" if visual.error else "")
+        )
+        if visual.result is not previous_result and visual.result is not None:
+            print(f"VLM result: {visual.result}")
+        if log is not None:
+            log.write(
+                "event",
+                float(simulation.data.time),
+                event="vision_update",
+                state=visual.state,
+                action=visual.action,
+                observed_at=visual.observed_at,
+                result=visual.result,
+                error=visual.error,
+            )
+
+
+def visual_preview(rgb: np.ndarray, visual: VisualStep, paused: bool) -> np.ndarray:
+    preview = rgb.copy()
+    lines = visual.status_lines(paused)
+    cv2.rectangle(
+        preview, (0, 0), (preview.shape[1] - 1, 17 * len(lines) + 4), (0, 0, 0), -1
+    )
+    for index, text in enumerate(lines):
+        cv2.putText(
+            preview,
+            text,
+            (4, 15 + index * 17),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    return preview
+
+
 def run_viewer(
     simulation: Simulation,
     *,
     camera: str = "follow",
     snapshot: Path = Path("runs/head_camera.ppm"),
     auto: bool = False,
+    vlm: bool = False,
     log: RunLog | None = None,
 ):
+    if vlm and (auto or simulation.policy is None):
+        raise ValueError(
+            "VLM steps require a walking policy and cannot run with --auto"
+        )
     behavior = make_behavior(simulation) if auto else None
     if log is not None:
         start_logging(simulation, behavior, log)
@@ -482,21 +538,46 @@ def run_viewer(
     paused = True
     model, data = simulation.model, simulation.data
     camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, CAMERA_NAME)
-    if camera == "head" and camera_id < 0:
+    if (camera == "head" or vlm) and camera_id < 0:
         raise ValueError(f"Scene has no {CAMERA_NAME} camera")
     print("Paused. Space: run/pause | R: reset and pause | Esc/window close: exit")
     if simulation.policy is None:
         print("No walking policy is active. The robot may fall when physics runs.")
     else:
         print("Up: forward | Left/Right: turn in place | Down: stop and balance")
-        print("Commands persist until the next arrow key; Space only pauses time.")
+        print(
+            "Arrow commands persist; Space also cancels VLM motion."
+            if vlm
+            else "Commands persist until the next arrow key; Space only pauses time."
+        )
+    if vlm:
+        print(
+            "VLM: Space to run, 8 for one observation/motion; arrows, Space and R cancel it."
+        )
+        if log is not None:
+            log.write(
+                "event",
+                float(data.time),
+                event="vision_config",
+                model=MODEL_ID,
+                revision=MODEL_REVISION,
+                prompt=PROMPT,
+                max_tokens=MAX_TOKENS,
+                temperature=0.0,
+                commands=COMMANDS,
+                move_seconds=MOVE_SECONDS,
+            )
     if auto:
         print("Auto enabled. Arrow keys: switch to manual | R: reset auto and pause")
     if camera_id >= 0:
         print(
             "Rendering > Camera: Tracking/head_camera | Enter: save raw + detection PPM"
         )
-        print("Bottom-right: head camera, green target box and yellow center (10 Hz)")
+        print(
+            "Bottom-right: head camera, VLM status and inference time"
+            if vlm
+            else "Bottom-right: head camera, green target box and yellow center (10 Hz)"
+        )
     with (
         (
             mujoco.Renderer(model, height=CAMERA_HEIGHT, width=CAMERA_WIDTH)
@@ -504,6 +585,7 @@ def run_viewer(
             else nullcontext()
         ) as renderer,
         mujoco.viewer.launch_passive(model, data, key_callback=commands.put) as viewer,
+        VisualStep() if vlm else nullcontext() as visual,
     ):
         with viewer.lock():
             viewer.cam.lookat[:] = (0, 0, 0.15)
@@ -518,6 +600,7 @@ def run_viewer(
             if camera == "head":
                 viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
                 viewer.cam.fixedcamid = camera_id
+        last_overlay = 0.0
         last_sync = 0.0
         next_step = time.monotonic()
         preview_dirty = False
@@ -535,17 +618,33 @@ def run_viewer(
                     except Empty:
                         break
                     if key == 256:  # Escape
+                        if visual is not None:
+                            simulation.set_command()
                         return
                     if key == 257 and renderer is not None:  # Enter
                         save_requested = True
                     if key == ord("R") or (behavior is not None and key in MOTION_KEYS):
                         next_capture = 0.0
+                    if visual is not None:
+                        if key in (32, ord("R"), *MOTION_KEYS):
+                            visual.cancel()
+                            simulation.set_command()
+                        if key == STEP_KEY:
+                            if not paused and visual.request(float(data.time)):
+                                simulation.set_command()
+                                print("VLM: settling, then capturing a fresh image")
+                            else:
+                                print(
+                                    f"VLM: 8 ignored ({'paused' if paused else visual.state})"
+                                )
                     was_paused = paused
                     paused = handle_key(simulation, key, paused, behavior, log)
                     if key == ord("R"):
                         next_log = data.time + LOG_PERIOD
                     if paused != was_paused or key == ord("R"):
                         next_step = started
+                if visual is not None:
+                    update_visual_step(simulation, visual, log)
                 if paused:
                     next_step = started
                 else:
@@ -554,6 +653,8 @@ def run_viewer(
                     for _ in range(20):
                         if next_step > started + 1e-9:
                             break
+                        if visual is not None:
+                            update_visual_step(simulation, visual, log)
                         simulation.step()
                         if log is not None and data.time + 1e-9 >= next_log:
                             record_sample(simulation, log)
@@ -561,12 +662,25 @@ def run_viewer(
                         next_step += model.opt.timestep
                     if next_step <= started:
                         next_step = started + model.opt.timestep
+                if visual is not None:
+                    update_visual_step(simulation, visual, log)
+                    if not paused and visual.needs_image(float(data.time)):
+                        visual.observe(
+                            render_head_camera(simulation, renderer), float(data.time)
+                        )
+                        print("VLM: thinking; zero motion command")
                 if renderer is not None and (
                     save_requested or data.time + 1e-9 >= next_capture
                 ):
                     rgb, preview = observe_camera(simulation, renderer, behavior, log)
                     preview_dirty = True
-                    next_capture = data.time + CAMERA_PERIOD
+                    camera_period = (
+                        VLM_CAMERA_PERIOD
+                        if visual is not None
+                        and visual.state in ("LOADING", "THINKING", "CANCELLING")
+                        else CAMERA_PERIOD
+                    )
+                    next_capture = data.time + camera_period
             if save_requested:
                 save_snapshot(snapshot, rgb)
                 save_snapshot(snapshot.with_stem(snapshot.stem + "_detection"), preview)
@@ -579,11 +693,21 @@ def run_viewer(
                     else None
                 )
                 if preview is not None and (
-                    preview_dirty or viewport_size != last_viewport
+                    preview_dirty
+                    or viewport_size != last_viewport
+                    or (visual is not None and started - last_overlay >= 0.1)
                 ):
-                    show_camera_preview(viewer, preview)
+                    image = (
+                        visual_preview(rgb, visual, paused)
+                        if visual is not None
+                        else preview
+                    )
+                    show_camera_preview(viewer, image)
+                    last_overlay = started
                     preview_dirty = False
                     last_viewport = viewport_size
                 last_sync = started
             wake_at = started + 1 / 60 if paused else next_step
             time.sleep(max(0, wake_at - time.monotonic()))
+        if visual is not None:
+            simulation.set_command()

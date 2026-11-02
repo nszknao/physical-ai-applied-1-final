@@ -25,8 +25,7 @@ SPEC.loader.exec_module(check)
 ANSWER = {
     "ball_position": "center",
     "goal_position": "center",
-    "action": "forward",
-    "reason": "Both are centered.",
+    "ball_fully_visible": True,
 }
 
 
@@ -53,8 +52,22 @@ class ImageAnalysisTests(unittest.TestCase):
             (root / "config.json").write_text('{"model_type": "qwen3_vl"}')
             generate = Mock(
                 side_effect=[
-                    SimpleNamespace(text=json.dumps(ANSWER), generation_tokens=50),
-                    SimpleNamespace(text="truncated JSON {", generation_tokens=256),
+                    SimpleNamespace(
+                        text=json.dumps(ANSWER),
+                        generation_tokens=50,
+                        prompt_tokens=100,
+                        prompt_tps=20.0,
+                        generation_tps=15.0,
+                        peak_memory=3.5,
+                    ),
+                    SimpleNamespace(
+                        text="truncated JSON {",
+                        generation_tokens=96,
+                        prompt_tokens=100,
+                        prompt_tps=20.0,
+                        generation_tps=15.0,
+                        peak_memory=3.5,
+                    ),
                 ]
             )
             load = Mock(return_value=("model", "processor"))
@@ -79,11 +92,14 @@ class ImageAnalysisTests(unittest.TestCase):
             self.assertEqual(snapshot.call_args.kwargs["revision"], MODEL_REVISION)
             self.assertEqual(generate.call_count, 2)
             first, second = report["images"]
-            self.assertEqual(first["decision"], ANSWER)
+            self.assertEqual(first["observation"], ANSWER)
+            self.assertEqual(first["prompt_tokens_per_second"], 20.0)
+            self.assertEqual(first["generation_tokens_per_second"], 15.0)
+            self.assertEqual(first["mlx_peak_memory_gb"], 3.5)
             self.assertEqual(first["original_size"], [960, 480])
             self.assertEqual(first["input_size"], [640, 320])
             self.assertEqual(len(first["sha256"]), 64)
-            self.assertIsNone(second["decision"])
+            self.assertIsNone(second["observation"])
             self.assertIsNotNone(second["validation_error"])
             self.assertEqual(second["raw_response"], "truncated JSON {")
             self.assertEqual(

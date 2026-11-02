@@ -13,27 +13,21 @@ import numpy as np
 
 MODEL_ID = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
 MODEL_REVISION = "2fd8dacbdb8f1e54b8c005f081ec5bf79c56376b"
-MAX_TOKENS = 256
+MAX_TOKENS = 96
 # This prompt describes the task, not the simulator's object coordinates.
-PROMPT = """You see one camera image from a small walking robot on a green field.
-The task is to approach an orange/red ball and push it into a white goal.
-Describe only what is visible. Do not infer hidden objects or metric distances.
-Return ONLY one JSON object with exactly these keys:
-{"ball_position": "left|center|right|not_visible|unknown",
- "goal_position": "left|center|right|not_visible|unknown",
- "action": "forward|turn_left|turn_right|stop", "reason": "short explanation"}
-Positions refer to the left, middle, or right third of the image.
-Use the center of the goal opening for goal_position.
-Choose ONE allowed value per field, not the list of alternatives.
-Recommend turning toward the ball if it is to the left or right. Recommend
-forward only if the ball and goal are both centered and clearly visible.
-Otherwise recommend stop, including when the ball is cut off at the bottom
-or the scene is uncertain. Explain the recommendation in one short sentence.
-This is an image inspection, not a claim that the goal has been scored.
+PROMPT = """Describe this robot camera image. Identify the orange/red ball and white goal.
+Return ONLY JSON with exactly these keys:
+{"ball_position":"center","goal_position":"center","ball_fully_visible":true}
+For each position choose left, center, right, not_visible, or unknown.
+Left/center/right are the three horizontal thirds of the image as displayed.
+Use the ball center and the center of the goal opening.
+ball_fully_visible is true only when the whole ball is visible without
+occlusion or clipping at an image edge. Use false if absent or uncertain.
+Report only visible evidence. Do not give actions, explanations or distances.
 """
 
 
-def parse_decision(text: str) -> dict:
+def parse_observation(text: str) -> dict:
     """Accept plain JSON or a single Markdown JSON fence, then check its schema."""
     text = text.strip()
     if text.startswith("```json\n") or text.startswith("```\n"):
@@ -41,19 +35,22 @@ def parse_decision(text: str) -> dict:
         if lines[-1] == "```":
             text = "\n".join(lines[1:-1])
     result = json.loads(text)
-    fields = {"ball_position", "goal_position", "action", "reason"}
+    fields = {"ball_position", "goal_position", "ball_fully_visible"}
     if not isinstance(result, dict) or set(result) != fields:
         raise ValueError(
-            "Expected exactly ball_position, goal_position, action, reason"
+            "Expected exactly ball_position, goal_position, ball_fully_visible"
         )
     positions = ("left", "center", "right", "not_visible", "unknown")
     for field in ("ball_position", "goal_position"):
         if result[field] not in positions:
             raise ValueError(f"Invalid {field}: {result[field]!r}")
-    if result["action"] not in ("forward", "turn_left", "turn_right", "stop"):
-        raise ValueError(f"Invalid action: {result['action']!r}")
-    if not isinstance(result["reason"], str) or not result["reason"].strip():
-        raise ValueError("reason must be a nonempty string")
+    if not isinstance(result["ball_fully_visible"], bool):
+        raise ValueError("ball_fully_visible must be a JSON boolean")
+    if (
+        result["ball_position"] in ("not_visible", "unknown")
+        and result["ball_fully_visible"]
+    ):
+        raise ValueError("An absent or unknown ball cannot be fully visible")
     return result
 
 
@@ -126,11 +123,15 @@ class VisionModel:
             "inference_seconds": round(perf_counter() - started, 3),
             "raw_response": result.text,
             "generation_tokens": result.generation_tokens,
+            "prompt_tokens": result.prompt_tokens,
+            "prompt_tokens_per_second": result.prompt_tps,
+            "generation_tokens_per_second": result.generation_tps,
+            "mlx_peak_memory_gb": result.peak_memory,
         }
         try:
-            record["decision"] = parse_decision(result.text)
+            record["observation"] = parse_observation(result.text)
             record["validation_error"] = None
         except ValueError as error:
-            record["decision"] = None
+            record["observation"] = None
             record["validation_error"] = str(error)
         return record
