@@ -1,5 +1,6 @@
 """Visual observations and bounded motion; physics stays on the caller thread."""
 
+import math
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -15,6 +16,12 @@ INITIAL_STAND_SECONDS = 2.0
 MOVE_SECONDS = 1.0
 APPROACH_SECONDS = 2.0
 PUSH_SECONDS = 8.0
+TURN_SECONDS = 2.0  # Time bound when turning toward a selected ball.
+MIN_TURN_SECONDS = {
+    "turn_left": 1.2,
+    "turn_right": 0.2,
+}  # Allow foot repositioning before testing heading.
+TURN_ANGLE = math.radians(8)  # Stop early using body heading; responses are asymmetric.
 MAX_OBSERVATIONS = 12  # Bound attempts even if perception never permits a push.
 # N toggles MuJoCo Island coloring; digits 0-5 toggle geometry groups.
 STEP_KEY = ord("8")
@@ -31,7 +38,7 @@ def choose_action(observation: dict | None) -> str:
     if observation is None or observation.get("ball_inside_image") is not True:
         return "stop"
     return {"left": "turn_left", "center": "forward", "right": "turn_right"}.get(
-        observation.get("ball_position"), "stop"
+        observation.get("tracking_position", observation.get("ball_position")), "stop"
     )
 
 
@@ -41,6 +48,8 @@ class VisualStep:
 
     loader: Callable[[], VisionModel] = VisionModel.load
     automatic: bool = False
+    target_color: str | None = None
+    stop_before_push: bool = False
     state: str = field(init=False, default="LOADING")
     action: str = field(init=False, default="stop")
     result: dict | None = field(init=False, default=None)
@@ -53,6 +62,8 @@ class VisualStep:
     _executor: ThreadPoolExecutor = field(init=False, repr=False)
     _future: Future | None = field(init=False, default=None, repr=False)
     _model: VisionModel | None = field(init=False, default=None, repr=False)
+    _turn_not_before: float = field(init=False, default=0.0)
+    _turn_heading: float | None = field(init=False, default=None)
     _deadline: float = field(init=False, default=0.0)
     _discard: bool = field(init=False, default=False)
     _started: float = field(init=False, default_factory=time.monotonic)
@@ -79,6 +90,7 @@ class VisualStep:
         return True
 
     def _settle(self, sim_time: float) -> None:
+        self._turn_heading = None
         self.action = "stop"
         self.result = None
         self.state = "SETTLING"
@@ -94,7 +106,15 @@ class VisualStep:
         self._started = time.monotonic()
         self._discard = False
         self.state = "THINKING"
-        self._future = self._executor.submit(self._model.analyze, rgb.copy())
+        self._future = self._executor.submit(
+            self._model.analyze,
+            rgb.copy(),
+            **(
+                {"target_color": self.target_color}
+                if self.target_color is not None
+                else {}
+            ),
+        )
 
     def cancel(self) -> None:
         self.running = False
@@ -125,6 +145,8 @@ class VisualStep:
         if observation is None:
             self.finish("STOPPED", "Invalid observation")
             return 0
+        if self.target_color is not None:
+            return self._plan_approach(observation)
         ball, goal = observation["ball_position"], observation["goal_position"]
         if goal != "center":
             self.finish("STOPPED", "Goal not centered; reposition with arrows, then 8")
@@ -144,7 +166,44 @@ class VisualStep:
         self.state = "MOVING"
         return APPROACH_SECONDS if self.action == "forward" else MOVE_SECONDS
 
-    def update(self, sim_time: float) -> tuple[float, float] | None:
+    def _plan_approach(self, observation: dict) -> float:
+        if observation.get("ball_at_bottom"):
+            if self.stop_before_push:
+                self.finish(
+                    "NEAR", f"Near {self.target_color} ball; stopped before pushing"
+                )
+                return 0
+            position = observation.get(
+                "tracking_position", observation["ball_position"]
+            )
+            # The lower edge hides depth, not horizontal position. Finish a
+            # small alignment turn before committing to the bounded push.
+            if position in ("left", "right"):
+                self.state = "MOVING"
+                self.action = "turn_left" if position == "left" else "turn_right"
+                return TURN_SECONDS
+            if (
+                not self._aligned
+                or position != "center"
+                or observation["goal_position"] not in ("left", "center", "right")
+            ):
+                self.finish("STOPPED", "Target or goal not confirmed for push")
+                return 0
+            self.state = "PUSHING"
+            self.action = "forward"
+            return PUSH_SECONDS
+        self.action = choose_action(observation)
+        if self.action == "stop":
+            self.finish("STOPPED", "Target absent or uncertain; 8: retry")
+            return 0
+        self._aligned = self.action == "forward"
+        self.state = "MOVING"
+        # Small forward steps avoid losing the nearby ball before the next image.
+        return MOVE_SECONDS if self.action == "forward" else TURN_SECONDS
+
+    def update(
+        self, sim_time: float, *, heading: float | None = None
+    ) -> tuple[float, float] | None:
         """Poll before each physics step; return only command changes to apply."""
         if self._future is not None and self._future.done():
             future, self._future = self._future, None
@@ -169,12 +228,28 @@ class VisualStep:
                 )
                 self.result = {**value, "action": self.action}
                 self._deadline = sim_time + duration
+                self._turn_not_before = sim_time + MIN_TURN_SECONDS.get(self.action, 0)
+                self._turn_heading = (
+                    heading
+                    if self.target_color is not None and self.action.startswith("turn_")
+                    else None
+                )
                 return COMMANDS[self.action]
             except Exception as error:
                 # Background failures must never leave a nonzero motion command.
                 self.error = str(error)
                 return self.finish("ERROR", "Inference failed")
-        if self.state in ("MOVING", "PUSHING") and sim_time + 1e-9 >= self._deadline:
+        turned = (
+            self._turn_heading is not None
+            and heading is not None
+            and sim_time + 1e-9 >= self._turn_not_before
+            and ((heading - self._turn_heading + math.pi) % (2 * math.pi) - math.pi)
+            * (1 if self.action == "turn_left" else -1)
+            >= TURN_ANGLE
+        )
+        if self.state in ("MOVING", "PUSHING") and (
+            turned or sim_time + 1e-9 >= self._deadline
+        ):
             if self.running:
                 if self.state == "PUSHING":
                     return self.finish("STOPPED", "Push ended without a goal")
@@ -194,7 +269,13 @@ class VisualStep:
         lines = [
             f"VLM {state}",
             ("Space: run | " if paused else "")
-            + ("8: start soccer" if self.automatic else "8: one step")
+            + (
+                f"8: {'approach' if self.stop_before_push else 'score'} {self.target_color}"
+                if self.target_color is not None
+                else "8: start soccer"
+                if self.automatic
+                else "8: one step"
+            )
             + " | Down: cancel",
         ]
         if self.result is not None:
@@ -202,6 +283,8 @@ class VisualStep:
             lines.append(
                 f"ball: {obs.get('ball_position', '?')}  goal: {obs.get('goal_position', '?')}"
             )
+            if "tracking_position" in obs:
+                lines.append(f"pixel tracking: {obs['tracking_position']}")
             lines.append(
                 f"infer {self.result['inference_seconds']:.2f}s | last {self.result['action']}"
             )

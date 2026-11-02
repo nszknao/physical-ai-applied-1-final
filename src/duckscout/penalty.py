@@ -9,6 +9,7 @@ import numpy as np
 @dataclass(kw_only=True)
 class GoalMonitor:
     model: mujoco.MjModel
+    ball_name: str = "ball"
     ball_qpos: int = field(init=False)
     radius: float = field(init=False)
     plane_x: float = field(init=False)
@@ -21,8 +22,8 @@ class GoalMonitor:
     def __post_init__(self):
         # Named static goal geometry defines the opening. This evaluator assumes +X
         # is into the goal, as in penalty.xml; object positions are not policy inputs.
-        self.ball_qpos = int(self.model.joint("ball_freejoint").qposadr[0])
-        self.radius = float(self.model.geom("ball").size[0])
+        self.ball_qpos = int(self.model.joint(f"{self.ball_name}_freejoint").qposadr[0])
+        self.radius = float(self.model.geom(self.ball_name).size[0])
         left, right = self.model.geom("goal_left"), self.model.geom("goal_right")
         bar = self.model.geom("goal_crossbar")
         self.plane_x = float(self.model.site("goal_line").pos[0]) + self.radius

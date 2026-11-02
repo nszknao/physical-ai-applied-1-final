@@ -3,7 +3,7 @@
 import json
 import platform
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -28,6 +28,18 @@ If an object is absent, use "not_visible". Report only visible evidence.
 """
 
 
+def selection_prompt(color: str) -> str:
+    """The task instruction selects the object; no image position is supplied."""
+    if color not in ("red", "blue"):
+        raise ValueError(f"Unsupported target color: {color}")
+    return (
+        f"Task: push the {color} ball into the white goal.\n"
+        + PROMPT.replace("orange/red ball", f"{color} ball")
+        + f"Only report the {color} ball. Ignore balls of other colors.\n"
+        + f'If no {color} ball is visible, use "not_visible" for ball_position.\n'
+    )
+
+
 def parse_observation(text: str) -> dict:
     """Validate the model's named directions, without accepting extra prose or lists."""
     text = text.strip()
@@ -47,22 +59,29 @@ def parse_observation(text: str) -> dict:
     return result
 
 
-def add_ball_boundary(rgb: np.ndarray, observation: dict) -> dict:
-    """Check image borders for the red ball identified by the VLM.
+def add_ball_boundary(
+    rgb: np.ndarray, observation: dict, *, color: str = "red", track: bool = False
+) -> dict:
+    """Check image borders for the requested ball identified by the VLM.
 
-    This penalty scene has a single orange/red ball. Reuse the color detector for
-    pixel boundaries only; never replace the VLM's directions or missing objects.
-    A red region in a different image third cannot validate the model's answer.
+    Each target color must identify a single ball. Tracking adds a separate pixel
+    direction after the VLM recognizes the requested object; it never replaces a
+    missing/unknown object. Without tracking, require agreement on image thirds.
     """
     result = {**observation, "ball_inside_image": False, "ball_at_bottom": False}
     if observation["ball_position"] not in ("left", "center", "right"):
         return result
-    detection = detect_target(rgb)
+    detection = detect_target(rgb, color=color)
     if detection is None:
         return result
     height, width = rgb.shape[:2]
     third = min(2, int(detection.center[0] * 3 / width))
-    if observation["ball_position"] != ("left", "center", "right")[third]:
+    image_position = ("left", "center", "right")[third]
+    if track:
+        # Keep the raw VLM direction. Use measured pixels for steering once the
+        # requested object is recognized; coarse image thirds are unreliable in motion.
+        result["tracking_position"] = image_position
+    elif observation["ball_position"] != image_position:
         return result
     x, y, w, h = detection.bbox
     # Bbox right/bottom are exclusive; touching the last row means y+h == height.
@@ -94,6 +113,7 @@ class VisionModel:
     model: Any
     processor: Any
     prompt: str
+    selection_prompts: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def load(cls) -> "VisionModel":
@@ -118,11 +138,28 @@ class VisionModel:
         model, processor = load(path, trust_remote_code=False)
         config = json.loads((Path(path) / "config.json").read_text())
         prompt = apply_chat_template(processor, config, PROMPT, num_images=1)
-        return cls(model=model, processor=processor, prompt=prompt)
+        return cls(
+            model=model,
+            processor=processor,
+            prompt=prompt,
+            selection_prompts={
+                color: apply_chat_template(
+                    processor, config, selection_prompt(color), num_images=1
+                )
+                for color in ("red", "blue")
+            },
+        )
 
-    def analyze(self, rgb: np.ndarray) -> dict:
+    def analyze(self, rgb: np.ndarray, *, target_color: str | None = None) -> dict:
         """Return the raw answer and schema validation; never issue commands."""
         rgb = prepare_image(rgb)
+        if target_color is not None and target_color not in self.selection_prompts:
+            raise ValueError(f"No selection prompt loaded for: {target_color}")
+        prompt = (
+            self.prompt
+            if target_color is None
+            else self.selection_prompts[target_color]
+        )
         # As in load(), keep optional Metal/Pillow dependencies at the API boundary.
         from mlx_vlm import generate
         from PIL import Image
@@ -131,7 +168,7 @@ class VisionModel:
         result = generate(
             self.model,
             self.processor,
-            self.prompt,
+            prompt,
             image=[Image.fromarray(rgb)],
             max_tokens=MAX_TOKENS,
             temperature=0.0,
@@ -148,7 +185,10 @@ class VisionModel:
         }
         try:
             record["observation"] = add_ball_boundary(
-                rgb, parse_observation(result.text)
+                rgb,
+                parse_observation(result.text),
+                color=target_color or "red",
+                track=target_color is not None,
             )
             record["validation_error"] = None
         except ValueError as error:

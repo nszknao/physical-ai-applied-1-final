@@ -1,5 +1,6 @@
 """Bounded visual actions, single-worker ownership and stale-result handling."""
 
+import math
 import threading
 import unittest
 from types import SimpleNamespace
@@ -49,9 +50,11 @@ class _WorkerTestCase(unittest.TestCase):
         self.started = threading.Event()
         self.worker_threads = []
         self.received = []
+        self.requested_colors = []
         self.response = answer()
 
-        def analyze(rgb):
+        def analyze(rgb, *, target_color=None):
+            self.requested_colors.append(target_color)
             self.worker_threads.append(threading.get_ident())
             self.started.set()
             if not self.release.wait(3):
@@ -257,6 +260,85 @@ class SoccerTests(_WorkerTestCase):
                 self.control.observe(np.zeros((2, 2, 3), np.uint8), now + 3)
         self.assertEqual(self.control.state, "STOPPED")
         self.assertFalse(self.control.running)
+
+
+class ApproachTests(_WorkerTestCase):
+    def setUp(self):
+        super().setUp()
+        self.control.automatic = True
+        self.control.target_color = "blue"
+        self.control.stop_before_push = True
+
+    def test_selected_color_reaches_worker_and_near_stops_without_pushing(self):
+        self.response = answer(fully_visible=False)
+        self.response["observation"]["ball_at_bottom"] = True
+        self.observe()
+        self.finish()
+        self.assertEqual(self.control.update(8, heading=0), COMMANDS["stop"])
+        self.assertEqual(self.control.state, "NEAR")
+        self.assertEqual(self.requested_colors, ["blue"])
+        self.assertFalse(self.control.running)
+        self.assertIsNone(self.control.update(100, heading=0))
+        self.assertFalse(self.control.request(101))
+
+    def test_turn_ignores_initial_twist_and_stops_on_signed_heading_change(self):
+        self.response = answer("left")
+        self.observe()
+        self.finish()
+        self.assertEqual(
+            self.control.update(8, heading=math.radians(179)), COMMANDS["turn_left"]
+        )
+        self.assertIsNone(self.control.update(8.5, heading=math.radians(-171)))
+        self.assertIsNone(
+            self.control.update(9.3, heading=math.radians(169))
+        )  # Wrong direction.
+        self.assertEqual(
+            self.control.update(9.4, heading=math.radians(-171)), COMMANDS["stop"]
+        )
+        self.assertEqual(self.control.state, "SETTLING")
+
+    def test_approach_does_not_require_goal_centering_but_still_requires_target(self):
+        self.response = answer()
+        self.response["observation"]["goal_position"] = "left"
+        self.observe()
+        self.finish()
+        self.assertEqual(self.control.update(8, heading=0), COMMANDS["forward"])
+        self.assertEqual(self.control.update(9, heading=0), COMMANDS["stop"])
+        self.response = answer("not_visible", False)
+        self.control.observe(np.zeros((2, 2, 3), np.uint8), 9.5)
+        self.finish()
+        self.assertEqual(self.control.update(15, heading=0), COMMANDS["stop"])
+        self.assertEqual(self.control.state, "STOPPED")
+
+    def test_selected_soccer_aligns_at_bottom_then_pushes_and_times_out(self):
+        self.control.stop_before_push = False
+        self.observe()
+        self.finish()
+        self.assertEqual(self.control.update(8, heading=0), COMMANDS["forward"])
+        self.control.update(9, heading=0)
+        self.response = answer(fully_visible=False)
+        self.response["observation"].update(
+            ball_at_bottom=True, tracking_position="left"
+        )
+        self.control.observe(np.zeros((2, 2, 3), np.uint8), 9.5)
+        self.finish()
+        self.assertEqual(self.control.update(14, heading=0), COMMANDS["turn_left"])
+        self.control.update(15.2, heading=math.radians(10))
+        self.response["observation"]["tracking_position"] = "center"
+        self.control.observe(np.zeros((2, 2, 3), np.uint8), 15.7)
+        self.finish()
+        self.assertEqual(self.control.update(20, heading=0), COMMANDS["forward"])
+        self.assertEqual(self.control.state, "PUSHING")
+        self.assertEqual(self.control.update(28), COMMANDS["stop"])
+        self.assertEqual(self.control.state, "STOPPED")
+
+    def test_cancel_discards_selected_target_result(self):
+        self.observe()
+        self.control.cancel()
+        self.finish()
+        self.assertIsNone(self.control.update(10, heading=0))
+        self.assertFalse(self.control.running)
+        self.assertEqual(self.control.state, "READY")
 
 
 if __name__ == "__main__":

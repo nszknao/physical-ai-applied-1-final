@@ -1,5 +1,6 @@
 """MuJoCo state, BAM motor control, and paused/headless execution."""
 
+import math
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field, fields
@@ -27,14 +28,23 @@ from duckscout.locomotion import (
 from duckscout.penalty import GoalMonitor
 from duckscout.perception import annotate_detection, detect_target, estimate_distance
 from duckscout.runlog import RunLog
-from duckscout.vision import MAX_TOKENS, MODEL_ID, MODEL_REVISION, PROMPT
+from duckscout.vision import (
+    MAX_TOKENS,
+    MODEL_ID,
+    MODEL_REVISION,
+    PROMPT,
+    selection_prompt,
+)
 from duckscout.visual_control import (
     APPROACH_SECONDS,
     COMMANDS,
     MAX_OBSERVATIONS,
+    MIN_TURN_SECONDS,
     MOVE_SECONDS,
     PUSH_SECONDS,
     STEP_KEY,
+    TURN_ANGLE,
+    TURN_SECONDS,
     VisualStep,
 )
 
@@ -482,14 +492,24 @@ def update_visual_step(
     visual: VisualStep,
     log: RunLog | None,
     goal: GoalMonitor | None = None,
+    wrong_goal: GoalMonitor | None = None,
 ) -> None:
     """Only the physics thread applies commands and writes logs."""
     previous_state, previous_result = visual.state, visual.result
     scored = goal.update(simulation.data) if goal is not None else False
+    wrong_scored = (
+        wrong_goal.update(simulation.data) if wrong_goal is not None else False
+    )
+    # Heading is proprioceptive feedback for bounded turns, not a target coordinate.
+    root = simulation.policy.root_qpos
+    w, x, y, z = simulation.data.qpos[root + 3 : root + 7]
+    heading = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
     command = (
-        visual.finish("GOAL", "GOAL! Ball crossed inside the posts")
+        visual.finish("MISSED", "Wrong ball scored; stopped")
+        if wrong_scored and visual.running
+        else visual.finish("GOAL", "GOAL! Requested ball crossed inside the posts")
         if scored and visual.running
-        else visual.update(float(simulation.data.time))
+        else visual.update(float(simulation.data.time), heading=heading)
     )
     if command is not None:
         simulation.set_command(forward=command[0], yaw_rate=command[1])
@@ -546,10 +566,28 @@ def run_viewer(
     auto: bool = False,
     vlm: bool = False,
     soccer: bool = False,
+    target_color: str | None = None,
     log: RunLog | None = None,
 ):
-    vlm = vlm or soccer
-    goal = GoalMonitor(model=simulation.model) if soccer else None
+    if target_color is not None and target_color not in ("red", "blue"):
+        raise ValueError("Target color must be red or blue")
+    vlm = vlm or soccer or target_color is not None
+    goal = (
+        GoalMonitor(
+            model=simulation.model,
+            ball_name="ball" if target_color is None else f"{target_color}_ball",
+        )
+        if soccer
+        else None
+    )
+    wrong_goal = (
+        GoalMonitor(
+            model=simulation.model,
+            ball_name="blue_ball" if target_color == "red" else "red_ball",
+        )
+        if soccer and target_color is not None
+        else None
+    )
     if vlm and (auto or simulation.policy is None):
         raise ValueError(
             "VLM steps require a walking policy and cannot run with --auto"
@@ -577,7 +615,9 @@ def run_viewer(
         )
     if vlm:
         print(
-            "VLM: Space to run, 8 to start soccer; arrows, Space and R cancel it."
+            f"VLM: Space to run, 8 to {'score with' if soccer else 'approach'} {target_color}; arrows/Space/R cancel."
+            if target_color is not None
+            else "VLM: Space to run, 8 to start soccer; arrows, Space and R cancel it."
             if soccer
             else "VLM: Space to run, 8 for one observation/motion; arrows, Space and R cancel it."
         )
@@ -588,12 +628,18 @@ def run_viewer(
                 event="vision_config",
                 model=MODEL_ID,
                 revision=MODEL_REVISION,
-                prompt=PROMPT,
+                prompt=PROMPT
+                if target_color is None
+                else selection_prompt(target_color),
+                target_color=target_color,
                 max_tokens=MAX_TOKENS,
                 temperature=0.0,
                 commands=COMMANDS,
                 move_seconds=MOVE_SECONDS,
-                automatic=soccer,
+                automatic=soccer or target_color is not None,
+                turn_seconds=TURN_SECONDS,
+                min_turn_seconds=MIN_TURN_SECONDS,
+                turn_angle_radians=TURN_ANGLE,
                 approach_seconds=APPROACH_SECONDS,
                 push_seconds=PUSH_SECONDS,
                 max_observations=MAX_OBSERVATIONS,
@@ -616,7 +662,13 @@ def run_viewer(
             else nullcontext()
         ) as renderer,
         mujoco.viewer.launch_passive(model, data, key_callback=commands.put) as viewer,
-        VisualStep(automatic=soccer) if vlm else nullcontext() as visual,
+        VisualStep(
+            automatic=soccer or target_color is not None,
+            target_color=target_color,
+            stop_before_push=not soccer,
+        )
+        if vlm
+        else nullcontext() as visual,
     ):
         with viewer.lock():
             viewer.cam.lookat[:] = (0, 0, 0.15)
@@ -674,11 +726,13 @@ def run_viewer(
                     if key == ord("R"):
                         if goal is not None:
                             goal.reset()
+                        if wrong_goal is not None:
+                            wrong_goal.reset()
                         next_log = data.time + LOG_PERIOD
                     if paused != was_paused or key == ord("R"):
                         next_step = started
                 if visual is not None:
-                    update_visual_step(simulation, visual, log, goal)
+                    update_visual_step(simulation, visual, log, goal, wrong_goal)
                 if paused:
                     next_step = started
                 else:
@@ -688,7 +742,9 @@ def run_viewer(
                         if next_step > started + 1e-9:
                             break
                         if visual is not None:
-                            update_visual_step(simulation, visual, log, goal)
+                            update_visual_step(
+                                simulation, visual, log, goal, wrong_goal
+                            )
                         simulation.step()
                         if log is not None and data.time + 1e-9 >= next_log:
                             record_sample(simulation, log)
@@ -697,7 +753,7 @@ def run_viewer(
                     if next_step <= started:
                         next_step = started + model.opt.timestep
                 if visual is not None:
-                    update_visual_step(simulation, visual, log, goal)
+                    update_visual_step(simulation, visual, log, goal, wrong_goal)
                     if not paused and visual.needs_image(float(data.time)):
                         frame = render_head_camera(simulation, renderer)
                         visual.observe(frame, float(data.time))

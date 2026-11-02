@@ -90,11 +90,11 @@ class ProjectedCubeRenderer:
         return image
 
 
-def projected_penalty_observation(simulation):
+def projected_penalty_observation(simulation, ball_name="ball"):
     """Perception test double using projection, NOT VLM/occlusion verification.
 
     Test-only ground truth supplies observations while the real walking policy and
-    ball contacts run. Production steering receives only camera-based VLM answers.
+    ball contacts run. Production steering uses camera-based VLM answers and color tracking.
     """
     model, data = simulation.model, simulation.data
     mujoco.mj_kinematics(model, data)
@@ -112,10 +112,10 @@ def projected_penalty_observation(simulation):
     def position(x):
         return "left" if x < 320 / 3 else "right" if x > 640 / 3 else "center"
 
-    qpos = model.joint("ball_freejoint").qposadr[0]
+    qpos = model.joint(f"{ball_name}_freejoint").qposadr[0]
     pixel, depth = project(data.qpos[qpos : qpos + 3])
     goal, _ = project(np.array([1.0, 0.0, 0.12]))
-    radius = focal * model.geom("ball").size[0] / depth
+    radius = focal * model.geom(ball_name).size[0] / depth
     visible = depth > 0 and pixel[1] - radius < 240
     return {
         "ball_position": position(pixel[0]) if visible else "not_visible",

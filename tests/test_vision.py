@@ -14,6 +14,7 @@ from duckscout.vision import (
     add_ball_boundary,
     parse_observation,
     prepare_image,
+    selection_prompt,
 )
 
 ANSWER = {
@@ -76,6 +77,56 @@ class BallBoundaryTests(unittest.TestCase):
         result = add_ball_boundary(image, ANSWER | {"ball_position": "left"})
         self.assertFalse(result["ball_inside_image"])
         self.assertFalse(result["ball_at_bottom"])
+
+    def test_requested_color_controls_boundary_check_without_replacing_direction(self):
+        image = np.zeros((240, 320, 3), np.uint8)
+        image[130:160, 30:60] = [255, 40, 5]
+        image[210:, 250:290] = [5, 40, 255]
+        red = add_ball_boundary(image, ANSWER | {"ball_position": "left"}, color="red")
+        blue = add_ball_boundary(
+            image, ANSWER | {"ball_position": "right"}, color="blue"
+        )
+        self.assertTrue(red["ball_inside_image"])
+        self.assertFalse(red["ball_at_bottom"])
+        self.assertFalse(blue["ball_inside_image"])
+        self.assertTrue(blue["ball_at_bottom"])
+        missing = add_ball_boundary(
+            image, ANSWER | {"ball_position": "not_visible"}, color="blue"
+        )
+        self.assertFalse(missing["ball_at_bottom"])
+
+    def test_tracking_keeps_vlm_answer_but_uses_requested_color_pixels(self):
+        # Regression: after turning, Qwen called a centered blue ball "right".
+        image = np.zeros((240, 320, 3), np.uint8)
+        image[149:186, 134:170] = [5, 40, 255]
+        raw = {"ball_position": "right", "goal_position": "left"}
+        result = add_ball_boundary(image, raw, color="blue", track=True)
+        self.assertEqual(result["ball_position"], "right")
+        self.assertEqual(result["tracking_position"], "center")
+        self.assertTrue(result["ball_inside_image"])
+        from duckscout.visual_control import choose_action
+
+        self.assertEqual(choose_action(result), "forward")
+        for position in ("not_visible", "unknown"):
+            rejected = add_ball_boundary(
+                image, raw | {"ball_position": position}, color="blue", track=True
+            )
+            self.assertEqual(choose_action(rejected), "stop")
+            self.assertNotIn("tracking_position", rejected)
+        missing = add_ball_boundary(image, raw, color="red", track=True)
+        self.assertEqual(choose_action(missing), "stop")
+
+
+class SelectionPromptTests(unittest.TestCase):
+    def test_task_names_only_requested_color_and_has_no_fixture_coordinates(self):
+        for color, other in (("red", "blue"), ("blue", "red")):
+            prompt = selection_prompt(color)
+            self.assertIn(f"push the {color} ball", prompt)
+            self.assertIn(f"Only report the {color} ball", prompt)
+            self.assertNotIn(f"{other} ball", prompt)
+            self.assertNotIn("0.7", prompt)
+        with self.assertRaises(ValueError):
+            selection_prompt("green")
 
 
 class ImageInputTests(unittest.TestCase):

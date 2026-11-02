@@ -20,6 +20,7 @@ from duckscout.vision import (
     PROMPT,
     VisionModel,
     prepare_image,
+    selection_prompt,
 )
 from duckscout.visual_control import choose_action
 
@@ -55,7 +56,12 @@ def capture_cases(output: Path) -> list[Path]:
     return paths
 
 
-def analyze_images(paths: list[Path], output: Path | None = None) -> dict:
+def analyze_images(
+    paths: list[Path],
+    output: Path | None = None,
+    *,
+    target_colors: tuple[str, ...] | None = None,
+) -> dict:
     """File input, batch timing and review artifacts belong to this check script."""
     if not paths:
         raise ValueError("At least one image is required")
@@ -72,15 +78,19 @@ def analyze_images(paths: list[Path], output: Path | None = None) -> dict:
             raise ValueError(f"Cannot decode image: {path}")
         height, width = frame.shape[:2]
         rgb = prepare_image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        images.append(rgb)
-        records.append(
-            {
-                "image": str(path.resolve()),
-                "sha256": hashlib.sha256(content).hexdigest(),
-                "original_size": [width, height],
-                "input_size": [rgb.shape[1], rgb.shape[0]],
-            }
-        )
+        for color in target_colors or (None,):
+            if color is not None:
+                selection_prompt(color)  # Validate before loading a model.
+            images.append(rgb)
+            records.append(
+                {
+                    **({"target_color": color} if color is not None else {}),
+                    "image": str(path.resolve()),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "original_size": [width, height],
+                    "input_size": [rgb.shape[1], rgb.shape[0]],
+                }
+            )
     print(f"Loading {MODEL_ID} (first download: about 3 GB)...", file=sys.stderr)
     started = perf_counter()
     with redirect_stdout(sys.stderr):
@@ -88,7 +98,9 @@ def analyze_images(paths: list[Path], output: Path | None = None) -> dict:
     report = {
         "model": MODEL_ID,
         "revision": MODEL_REVISION,
-        "prompt": PROMPT,
+        "prompt": PROMPT
+        if target_colors is None
+        else {color: selection_prompt(color) for color in target_colors},
         "generation": {"max_tokens": MAX_TOKENS, "temperature": 0.0},
         "versions": {
             name: version(name) for name in ("mlx", "mlx-vlm", "transformers")
@@ -101,7 +113,11 @@ def analyze_images(paths: list[Path], output: Path | None = None) -> dict:
     for index, (rgb, record) in enumerate(zip(images, records, strict=True)):
         print(f"Analyzing {record['image']}...", file=sys.stderr)
         with redirect_stdout(sys.stderr):
-            record.update(vision.analyze(rgb))
+            record.update(
+                vision.analyze(rgb)
+                if "target_color" not in record
+                else vision.analyze(rgb, target_color=record["target_color"])
+            )
         record["action"] = choose_action(record["observation"])
         report["images"].append(record)
         if output is not None:

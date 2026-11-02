@@ -56,8 +56,15 @@ def main(arguments: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--soccer",
-        action="store_true",
-        help="8: start automatic VLM approach and bounded goal push (requires --policy)",
+        nargs="?",
+        const="single",
+        choices=("single", "red", "blue"),
+        help="8: score with a selected red/blue ball, or the single-ball scene (requires --policy)",
+    )
+    parser.add_argument(
+        "--approach",
+        choices=("red", "blue"),
+        help="8: select the requested ball, approach and stop before pushing (requires --policy)",
     )
     parser.add_argument(
         "--auto",
@@ -103,9 +110,16 @@ def main(arguments: list[str] | None = None) -> int:
     )
     arguments = sys.argv[1:] if arguments is None else arguments
     args = parser.parse_args(arguments)
-    args.vlm = args.vlm or args.soccer
+    if args.approach is not None and args.soccer:
+        parser.error("--approach stops before pushing; cannot combine with --soccer")
+    selected_color = args.soccer if args.soccer in ("red", "blue") else args.approach
+    args.vlm = bool(args.vlm or args.soccer or selected_color is not None)
     args.scene = args.scene or Path(
-        "assets/scenes/penalty.xml" if args.vlm else "assets/scenes/search.xml"
+        "assets/scenes/choice.xml"
+        if selected_color is not None
+        else "assets/scenes/penalty.xml"
+        if args.vlm
+        else "assets/scenes/search.xml"
     )
     if args.vlm and (args.policy is None or args.auto or args.headless):
         parser.error(
@@ -158,7 +172,8 @@ def main(arguments: list[str] | None = None) -> int:
                     simulation,
                     camera=args.camera,
                     vlm=args.vlm,
-                    soccer=args.soccer,
+                    soccer=bool(args.soccer),
+                    target_color=selected_color,
                     snapshot=args.snapshot or Path("runs/head_camera.ppm"),
                     auto=args.auto,
                     log=log,

@@ -112,6 +112,29 @@ class ImageAnalysisTests(unittest.TestCase):
             rgb = pil_image.fromarray.call_args.args[0]
             np.testing.assert_array_equal(rgb[80, 160], [255, 0, 0])
 
+    def test_same_pixels_are_analyzed_for_both_instructions_with_one_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "frame.png"
+            cv2.imwrite(str(path), np.zeros((240, 320, 3), np.uint8))
+            model = Mock()
+            model.analyze.return_value = {
+                "observation": None,
+                "validation_error": "test",
+            }
+            with patch.object(check.VisionModel, "load", return_value=model) as load:
+                report = check.analyze_images([path], target_colors=("red", "blue"))
+            load.assert_called_once()
+            red, blue = model.analyze.call_args_list
+            np.testing.assert_array_equal(red.args[0], blue.args[0])
+            self.assertEqual(red.kwargs, {"target_color": "red"})
+            self.assertEqual(blue.kwargs, {"target_color": "blue"})
+            self.assertEqual(
+                report["images"][0]["sha256"], report["images"][1]["sha256"]
+            )
+            self.assertEqual(
+                [r["target_color"] for r in report["images"]], ["red", "blue"]
+            )
+
 
 class CheckCliTests(unittest.TestCase):
     def test_image_paths_bypass_capture_and_output_json(self):

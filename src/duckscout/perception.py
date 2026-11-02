@@ -1,4 +1,4 @@
-"""Detect the largest red region in an RGB camera image."""
+"""Detect the largest region of a selected color in an RGB camera image."""
 
 from dataclasses import dataclass
 
@@ -17,8 +17,8 @@ class Detection:
     area: int  # Red pixel count, not bounding-box area or confidence.
 
 
-def detect_target(rgb: np.ndarray) -> Detection | None:
-    """Return the largest red component, or None when no component is large enough."""
+def detect_target(rgb: np.ndarray, *, color: str = "red") -> Detection | None:
+    """Return the largest component of the requested color; default is the red target."""
     if (
         rgb.ndim != 3
         or rgb.shape[2] != 3
@@ -28,8 +28,13 @@ def detect_target(rgb: np.ndarray) -> Detection | None:
         raise ValueError("Expected a nonempty HxWx3 uint8 RGB image")
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     # OpenCV hue is 0..179. Red spans both ends of that interval.
-    mask = cv2.inRange(hsv, (0, 120, 50), (10, 255, 255))
-    mask |= cv2.inRange(hsv, (170, 120, 50), (179, 255, 255))
+    if color == "red":
+        mask = cv2.inRange(hsv, (0, 120, 50), (10, 255, 255))
+        mask |= cv2.inRange(hsv, (170, 120, 50), (179, 255, 255))
+    elif color == "blue":
+        mask = cv2.inRange(hsv, (100, 120, 50), (130, 255, 255))
+    else:
+        raise ValueError(f"Unsupported target color: {color}")
     count, _, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if count <= 1:
         return None
