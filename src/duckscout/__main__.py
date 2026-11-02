@@ -55,6 +55,11 @@ def main(arguments: list[str] | None = None) -> int:
         help="8: one VLM observation and short motion (requires --policy)",
     )
     parser.add_argument(
+        "--soccer",
+        action="store_true",
+        help="8: start automatic VLM approach and bounded goal push (requires --policy)",
+    )
+    parser.add_argument(
         "--auto",
         action="store_true",
         help="Search, approach and stop using head-camera detections (requires --policy)",
@@ -98,6 +103,7 @@ def main(arguments: list[str] | None = None) -> int:
     )
     arguments = sys.argv[1:] if arguments is None else arguments
     args = parser.parse_args(arguments)
+    args.vlm = args.vlm or args.soccer
     args.scene = args.scene or Path(
         "assets/scenes/penalty.xml" if args.vlm else "assets/scenes/search.xml"
     )
@@ -152,6 +158,7 @@ def main(arguments: list[str] | None = None) -> int:
                     simulation,
                     camera=args.camera,
                     vlm=args.vlm,
+                    soccer=args.soccer,
                     snapshot=args.snapshot or Path("runs/head_camera.ppm"),
                     auto=args.auto,
                     log=log,

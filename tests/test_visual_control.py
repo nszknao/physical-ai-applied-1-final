@@ -14,7 +14,7 @@ def answer(position="center", fully_visible=True, error=None):
         "observation": {
             "ball_position": position,
             "goal_position": "center",
-            "ball_fully_visible": fully_visible,
+            "ball_inside_image": fully_visible,
         },
         "validation_error": error,
         "inference_seconds": 4.0,
@@ -43,7 +43,7 @@ class ActionTests(unittest.TestCase):
         self.assertLess(COMMANDS["turn_right"][1], 0)
 
 
-class VisualStepTests(unittest.TestCase):
+class _WorkerTestCase(unittest.TestCase):
     def setUp(self):
         self.release = threading.Event()
         self.started = threading.Event()
@@ -92,6 +92,8 @@ class VisualStepTests(unittest.TestCase):
         except RuntimeError:
             pass  # The controller, rather than the test thread, handles this failure.
 
+
+class VisualStepTests(_WorkerTestCase):
     def test_slow_inference_never_blocks_updates_and_motion_is_one_pulse(self):
         self.observe()
         for sim_time in (3, 4, 20):
@@ -165,6 +167,96 @@ class VisualStepTests(unittest.TestCase):
             self.assertEqual(control.update(0), COMMANDS["stop"])
             self.assertEqual(control.state, "ERROR")
             self.assertIn("Metal unavailable", control.error)
+
+
+class SoccerTests(_WorkerTestCase):
+    def setUp(self):
+        super().setUp()
+        self.control.automatic = True
+
+    # Single-step-specific tests remain in VisualStepTests. Here the shared worker
+    # helpers exercise the same asynchronous API for an entire attempt.
+    def test_slow_inference_never_blocks_updates_and_motion_is_one_pulse(self):
+        self.observe()
+        self.assertIsNone(self.control.update(8))
+        self.finish()
+        self.assertEqual(self.control.update(8), COMMANDS["forward"])
+        self.assertEqual(self.control.update(10), COMMANDS["stop"])
+        self.assertEqual(self.control.state, "SETTLING")
+        self.assertFalse(self.control.needs_image(10.49))
+        self.assertTrue(self.control.needs_image(10.5))
+        self.response = answer(fully_visible=False)
+        self.response["observation"]["ball_at_bottom"] = True
+        self.control.observe(np.zeros((2, 2, 3), np.uint8), 10.5)
+        self.finish()
+        self.assertEqual(self.control.update(15), COMMANDS["forward"])
+        self.assertEqual(self.control.state, "PUSHING")
+        self.assertIsNone(self.control.update(22.99))
+        self.assertEqual(self.control.update(23), COMMANDS["stop"])
+        self.assertEqual(self.control.state, "STOPPED")
+        self.assertFalse(self.control.running)
+        self.assertTrue(self.control.request(24))
+
+    def test_invalid_answer_stops_even_when_it_contains_a_visible_ball(self):
+        self.response = answer(error="invalid JSON")
+        self.observe()
+        self.finish()
+        self.assertEqual(self.control.update(3), COMMANDS["stop"])
+        self.assertEqual(self.control.state, "STOPPED")
+
+    def test_unaligned_or_unseen_ball_cannot_start_a_blind_push(self):
+        for observation in (
+            answer()["observation"] | {"goal_position": "left"},
+            answer(fully_visible=False)["observation"] | {"ball_at_bottom": True},
+            answer("not_visible", False)["observation"],
+        ):
+            self.control.cancel()
+            self.response = answer() | {"observation": observation}
+            self.observe()
+            self.finish()
+            self.assertEqual(self.control.update(3), COMMANDS["stop"])
+            self.assertEqual(self.control.state, "STOPPED")
+
+    def test_initial_clipped_result_stops_but_8_can_request_a_fresh_observation(self):
+        self.response = answer(fully_visible=False)
+        self.response["observation"]["ball_at_bottom"] = True
+        self.observe()
+        self.finish()
+        self.assertEqual(self.control.update(8), COMMANDS["stop"])
+        self.assertEqual(self.control.state, "STOPPED")
+        self.assertIn("Clipped before approach", self.control.reason)
+        self.assertIsNone(self.control.update(9))  # No automatic retry.
+        self.assertTrue(self.control.request(10))
+        self.assertFalse(self.control.needs_image(10.49))
+        self.response = answer()
+        self.control.observe(np.zeros((2, 2, 3), np.uint8), 10.5)
+        self.finish()
+        self.assertEqual(self.control.update(15), COMMANDS["forward"])
+        self.assertEqual(self.control.state, "MOVING")
+
+    def test_goal_discards_a_pending_result_and_does_not_restart(self):
+        self.observe()
+        self.assertEqual(self.control.finish("GOAL", "scored"), COMMANDS["stop"])
+        self.finish()
+        self.assertIsNone(self.control.update(10))
+        self.assertEqual(self.control.state, "GOAL")
+        self.assertFalse(self.control.request(11))
+        self.control.cancel()
+        self.assertTrue(self.control.request(0))
+
+    def test_attempt_is_bounded_when_the_ball_never_gets_closer(self):
+        from duckscout.visual_control import APPROACH_SECONDS, MAX_OBSERVATIONS
+
+        self.observe()
+        for index in range(MAX_OBSERVATIONS):
+            now = 10 + index * 4
+            self.finish()
+            self.control.update(now)
+            self.control.update(now + APPROACH_SECONDS)
+            if index < MAX_OBSERVATIONS - 1:
+                self.control.observe(np.zeros((2, 2, 3), np.uint8), now + 3)
+        self.assertEqual(self.control.state, "STOPPED")
+        self.assertFalse(self.control.running)
 
 
 if __name__ == "__main__":

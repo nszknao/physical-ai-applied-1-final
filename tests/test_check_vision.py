@@ -25,7 +25,8 @@ SPEC.loader.exec_module(check)
 ANSWER = {
     "ball_position": "center",
     "goal_position": "center",
-    "ball_fully_visible": True,
+    "ball_inside_image": True,
+    "ball_at_bottom": False,
 }
 
 
@@ -47,13 +48,15 @@ class ImageAnalysisTests(unittest.TestCase):
             root = Path(directory)
             image = root / "camera.png"
             frame = np.zeros((480, 960, 3), dtype=np.uint8)
-            frame[:, :, 2] = 255
+            frame[200:300, 450:510, 2] = 255
             cv2.imwrite(str(image), frame)
             (root / "config.json").write_text('{"model_type": "qwen3_vl"}')
             generate = Mock(
                 side_effect=[
                     SimpleNamespace(
-                        text=json.dumps(ANSWER),
+                        text=json.dumps(
+                            {"ball_position": "center", "goal_position": "center"}
+                        ),
                         generation_tokens=50,
                         prompt_tokens=100,
                         prompt_tps=20.0,
@@ -97,7 +100,7 @@ class ImageAnalysisTests(unittest.TestCase):
             self.assertEqual(first["generation_tokens_per_second"], 15.0)
             self.assertEqual(first["mlx_peak_memory_gb"], 3.5)
             self.assertEqual(first["original_size"], [960, 480])
-            self.assertEqual(first["input_size"], [640, 320])
+            self.assertEqual(first["input_size"], [320, 160])
             self.assertEqual(len(first["sha256"]), 64)
             self.assertIsNone(second["observation"])
             self.assertIsNotNone(second["validation_error"])
@@ -107,7 +110,7 @@ class ImageAnalysisTests(unittest.TestCase):
             )
             self.assertTrue((root / "output/input-02.png").exists())
             rgb = pil_image.fromarray.call_args.args[0]
-            np.testing.assert_array_equal(rgb[0, 0], [255, 0, 0])
+            np.testing.assert_array_equal(rgb[80, 160], [255, 0, 0])
 
 
 class CheckCliTests(unittest.TestCase):
@@ -179,15 +182,21 @@ class CaptureTests(unittest.TestCase):
             paths = check.capture_cases(Path("frames"))
         self.assertEqual(
             [p.name for p in paths],
-            ["center.ppm", "left.ppm", "right.ppm", "absent.ppm"],
+            ["center.ppm", "left.ppm", "right.ppm", "absent.ppm", "clipped.ppm"],
         )
         np.testing.assert_allclose(
             positions,
-            [[0.7, 0, 0.04], [0.7, 0.2, 0.04], [0.7, -0.2, 0.04], [-0.7, 0, 0.04]],
+            [
+                [0.7, 0, 0.04],
+                [0.7, 0.2, 0.04],
+                [0.7, -0.2, 0.04],
+                [-0.7, 0, 0.04],
+                [0.35, 0, 0.04],
+            ],
         )
-        self.assertEqual(simulation.step.call_count, 1600)
-        self.assertEqual(render.call_count, 4)
-        self.assertEqual(save.call_count, 4)
+        self.assertEqual(simulation.step.call_count, 2000)
+        self.assertEqual(render.call_count, 5)
+        self.assertEqual(save.call_count, 5)
 
 
 if __name__ == "__main__":

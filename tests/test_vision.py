@@ -11,6 +11,7 @@ from duckscout.vision import (
     MODEL_REVISION,
     PROMPT,
     VisionModel,
+    add_ball_boundary,
     parse_observation,
     prepare_image,
 )
@@ -18,7 +19,6 @@ from duckscout.vision import (
 ANSWER = {
     "ball_position": "center",
     "goal_position": "center",
-    "ball_fully_visible": True,
 }
 
 
@@ -34,18 +34,48 @@ class ObservationTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 parse_observation(raw)
 
-    def test_rejects_unknown_fields_enums_and_non_boolean_visibility(self):
-        for replacement in (
-            {"action": "kick"},
-            {"ball_position": None},
-            {"goal_position": []},
-            {"ball_fully_visible": "true"},
-            {"ball_fully_visible": 1},
-            {"confidence": 1.0},
-            {"ball_position": "not_visible", "ball_fully_visible": True},
+    def test_rejects_unknown_fields_enums_and_arrays(self):
+        for value in (
+            {**ANSWER, "ball_position": True},
+            {**ANSWER, "goal_position": []},
+            {**ANSWER, "ball_position": None},
+            {**ANSWER, "action": "forward"},
+            {**ANSWER, "goal_position": "absent"},
+            [["center", "center", "full"], ["center", "center", "full"]],
+            ["center", "center", "bottom"],
         ):
-            with self.subTest(replacement=replacement), self.assertRaises(ValueError):
-                parse_observation(json.dumps(ANSWER | replacement))
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_observation(json.dumps(value))
+
+
+class BallBoundaryTests(unittest.TestCase):
+    def test_low_ball_is_inside_until_it_reaches_the_last_row(self):
+        image = np.zeros((240, 320, 3), np.uint8)
+        image[200:239, 140:180] = [255, 40, 5]
+        observation = add_ball_boundary(image, ANSWER)
+        self.assertTrue(observation["ball_inside_image"])
+        self.assertFalse(observation["ball_at_bottom"])
+        image[239:, 140:180] = [255, 40, 5]
+        observation = add_ball_boundary(image, ANSWER)
+        self.assertFalse(observation["ball_inside_image"])
+        self.assertTrue(observation["ball_at_bottom"])
+
+    def test_no_red_region_or_wrong_direction_cannot_enable_motion(self):
+        image = np.zeros((240, 320, 3), np.uint8)
+        self.assertFalse(add_ball_boundary(image, ANSWER)["ball_inside_image"])
+        image[140:180, 140:180] = [255, 40, 5]
+        for position in ("not_visible", "unknown", "left"):
+            result = add_ball_boundary(image, ANSWER | {"ball_position": position})
+            self.assertFalse(result["ball_inside_image"])
+            self.assertFalse(result["ball_at_bottom"])
+            self.assertEqual(result["ball_position"], position)
+
+    def test_touching_a_side_cannot_enable_a_forward_push(self):
+        image = np.zeros((240, 320, 3), np.uint8)
+        image[200:, :30] = [255, 40, 5]
+        result = add_ball_boundary(image, ANSWER | {"ball_position": "left"})
+        self.assertFalse(result["ball_inside_image"])
+        self.assertFalse(result["ball_at_bottom"])
 
 
 class ImageInputTests(unittest.TestCase):
@@ -53,7 +83,7 @@ class ImageInputTests(unittest.TestCase):
         rgb = np.zeros((480, 960, 3), dtype=np.uint8)
         rgb[:, :, 0] = 255
         resized = prepare_image(rgb)
-        self.assertEqual(resized.shape, (320, 640, 3))
+        self.assertEqual(resized.shape, (160, 320, 3))
         np.testing.assert_array_equal(resized[0, 0], [255, 0, 0])
 
     def test_invalid_camera_images_fail_before_backend_import(self):
@@ -100,7 +130,9 @@ class QwenProcessorTests(unittest.TestCase):
         )
         # Match MLX-VLM's PyTorch fallback for Transformers fast processors.
         inputs = processor(
-            text=[prompt], images=[Image.new("RGB", (320, 240))], return_tensors="pt"
+            text=[prompt],
+            images=[Image.fromarray(prepare_image(np.zeros((240, 320, 3), np.uint8)))],
+            return_tensors="pt",
         )
         self.assertEqual(inputs["input_ids"].shape[0], 1)
         self.assertEqual(inputs["image_grid_thw"].shape, (1, 3))

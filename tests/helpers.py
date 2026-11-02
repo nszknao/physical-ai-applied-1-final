@@ -88,3 +88,46 @@ class ProjectedCubeRenderer:
         hull = cv2.convexHull(np.round(pixels).astype(np.int32))
         cv2.fillConvexPoly(image, hull, (255, 0, 0))
         return image
+
+
+def projected_penalty_observation(simulation):
+    """Perception test double using projection, NOT VLM/occlusion verification.
+
+    Test-only ground truth supplies observations while the real walking policy and
+    ball contacts run. Production steering receives only camera-based VLM answers.
+    """
+    model, data = simulation.model, simulation.data
+    mujoco.mj_kinematics(model, data)
+    mujoco.mj_camlight(model, data)
+    camera = data.camera("head_camera")
+    focal = 120 / np.tan(np.deg2rad(model.camera("head_camera").fovy[0] / 2))
+
+    def project(point):
+        local = camera.xmat.reshape(3, 3).T @ (point - camera.xpos)
+        depth = -local[2]
+        return np.array(
+            [160 + focal * local[0] / depth, 120 - focal * local[1] / depth]
+        ), depth
+
+    def position(x):
+        return "left" if x < 320 / 3 else "right" if x > 640 / 3 else "center"
+
+    qpos = model.joint("ball_freejoint").qposadr[0]
+    pixel, depth = project(data.qpos[qpos : qpos + 3])
+    goal, _ = project(np.array([1.0, 0.0, 0.12]))
+    radius = focal * model.geom("ball").size[0] / depth
+    visible = depth > 0 and pixel[1] - radius < 240
+    return {
+        "ball_position": position(pixel[0]) if visible else "not_visible",
+        "goal_position": position(goal[0]),
+        "ball_inside_image": bool(
+            depth > 0
+            and radius <= pixel[0] <= 320 - radius
+            and radius <= pixel[1] <= 240 - radius
+        ),
+        "ball_at_bottom": bool(
+            depth > 0
+            and 240 - radius < pixel[1] < 240 + radius
+            and 0 <= pixel[0] <= 320
+        ),
+    }

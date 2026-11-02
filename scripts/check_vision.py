@@ -1,4 +1,4 @@
-"""Inspect saved images or four reproducible MuJoCo scenes with the real VLM."""
+"""Inspect saved images or five reproducible MuJoCo scenes with the real VLM."""
 
 import argparse
 import hashlib
@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def capture_cases(output: Path) -> list[Path]:
-    """Render centered/offset/hidden balls after two seconds of standing."""
+    """Render centered/offset/hidden/bottom-clipped balls after two seconds of standing."""
     simulation = Simulation.from_scene(
         ROOT / "assets/scenes/penalty.xml",
         policy_path=ROOT / "assets/vendor/microduck-policies/velstand.onnx",
@@ -40,6 +40,7 @@ def capture_cases(output: Path) -> list[Path]:
             ("left", (0.7, 0.2, 0.04)),
             ("right", (0.7, -0.2, 0.04)),
             ("absent", (-0.7, 0, 0.04)),
+            ("clipped", (0.35, 0, 0.04)),
         ):
             # Fixture placement only: inference receives pixels, not these coordinates.
             simulation.model.key_qpos[simulation.key_id, ball_qpos : ball_qpos + 3] = (
@@ -117,7 +118,7 @@ def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("images", nargs="*", type=Path, metavar="IMAGE")
     parser.add_argument(
-        "--cases", action="store_true", help="Capture and analyze four ball placements"
+        "--cases", action="store_true", help="Capture and analyze five ball placements"
     )
     parser.add_argument(
         "--output",

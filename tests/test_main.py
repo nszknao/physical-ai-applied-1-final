@@ -67,6 +67,9 @@ class LauncherTests(unittest.TestCase):
 class ArgumentTests(unittest.TestCase):
     def test_vlm_requires_policy_viewer_and_no_other_automatic_controller(self):
         for args in (
+            ["--soccer"],
+            ["--soccer", "--policy", "--headless"],
+            ["--soccer", "--policy", "--auto"],
             ["--vlm"],
             ["--vlm", "--policy", "--headless"],
             ["--vlm", "--policy", "--auto"],
@@ -90,6 +93,18 @@ class ArgumentTests(unittest.TestCase):
         self.assertEqual(load.call_args.args[0], Path("assets/scenes/penalty.xml"))
         self.assertTrue(viewer.call_args.kwargs["vlm"])
         launch.assert_called_once()
+
+    def test_soccer_enables_vlm_and_defaults_to_penalty(self):
+        with (
+            patch("duckscout.__main__.ensure_viewer_process"),
+            patch("duckscout.__main__.Simulation.from_scene") as load,
+            patch("duckscout.__main__.run_viewer") as viewer,
+            patch.object(Path, "is_file", return_value=True),
+        ):
+            self.assertEqual(main(["--policy", "--soccer"]), 0)
+        self.assertEqual(load.call_args.args[0], Path("assets/scenes/penalty.xml"))
+        self.assertTrue(viewer.call_args.kwargs["vlm"])
+        self.assertTrue(viewer.call_args.kwargs["soccer"])
 
     def test_auto_requires_policy_and_target_coordinates_must_be_finite(self):
         for arguments in (["--auto"], ["--target", "nan", "0"]):

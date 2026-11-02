@@ -24,10 +24,19 @@ from duckscout.locomotion import (
     TURN_SPEED,
     LocomotionPolicy,
 )
+from duckscout.penalty import GoalMonitor
 from duckscout.perception import annotate_detection, detect_target, estimate_distance
 from duckscout.runlog import RunLog
 from duckscout.vision import MAX_TOKENS, MODEL_ID, MODEL_REVISION, PROMPT
-from duckscout.visual_control import COMMANDS, MOVE_SECONDS, STEP_KEY, VisualStep
+from duckscout.visual_control import (
+    APPROACH_SECONDS,
+    COMMANDS,
+    MAX_OBSERVATIONS,
+    MOVE_SECONDS,
+    PUSH_SECONDS,
+    STEP_KEY,
+    VisualStep,
+)
 
 # Flat-floor posture limits, independent of distance traveled.
 MIN_UPRIGHT_HEIGHT = 0.08
@@ -469,17 +478,29 @@ def show_camera_preview(viewer: mujoco.viewer.Handle, image: np.ndarray) -> None
 
 
 def update_visual_step(
-    simulation: Simulation, visual: VisualStep, log: RunLog | None
+    simulation: Simulation,
+    visual: VisualStep,
+    log: RunLog | None,
+    goal: GoalMonitor | None = None,
 ) -> None:
     """Only the physics thread applies commands and writes logs."""
     previous_state, previous_result = visual.state, visual.result
-    command = visual.update(float(simulation.data.time))
+    scored = goal.update(simulation.data) if goal is not None else False
+    command = (
+        visual.finish("GOAL", "GOAL! Ball crossed inside the posts")
+        if scored and visual.running
+        else visual.update(float(simulation.data.time))
+    )
     if command is not None:
         simulation.set_command(forward=command[0], yaw_rate=command[1])
     if visual.state != previous_state or visual.result is not previous_result:
         print(
             f"VLM: {visual.state} | {visual.action}"
-            + (f" | {visual.error}" if visual.error else "")
+            + (
+                f" | {visual.error or visual.reason}"
+                if visual.error or visual.reason
+                else ""
+            )
         )
         if visual.result is not previous_result and visual.result is not None:
             print(f"VLM result: {visual.result}")
@@ -493,6 +514,7 @@ def update_visual_step(
                 observed_at=visual.observed_at,
                 result=visual.result,
                 error=visual.error,
+                reason=visual.reason,
             )
 
 
@@ -523,8 +545,11 @@ def run_viewer(
     snapshot: Path = Path("runs/head_camera.ppm"),
     auto: bool = False,
     vlm: bool = False,
+    soccer: bool = False,
     log: RunLog | None = None,
 ):
+    vlm = vlm or soccer
+    goal = GoalMonitor(model=simulation.model) if soccer else None
     if vlm and (auto or simulation.policy is None):
         raise ValueError(
             "VLM steps require a walking policy and cannot run with --auto"
@@ -552,7 +577,9 @@ def run_viewer(
         )
     if vlm:
         print(
-            "VLM: Space to run, 8 for one observation/motion; arrows, Space and R cancel it."
+            "VLM: Space to run, 8 to start soccer; arrows, Space and R cancel it."
+            if soccer
+            else "VLM: Space to run, 8 for one observation/motion; arrows, Space and R cancel it."
         )
         if log is not None:
             log.write(
@@ -566,6 +593,10 @@ def run_viewer(
                 temperature=0.0,
                 commands=COMMANDS,
                 move_seconds=MOVE_SECONDS,
+                automatic=soccer,
+                approach_seconds=APPROACH_SECONDS,
+                push_seconds=PUSH_SECONDS,
+                max_observations=MAX_OBSERVATIONS,
             )
     if auto:
         print("Auto enabled. Arrow keys: switch to manual | R: reset auto and pause")
@@ -585,7 +616,7 @@ def run_viewer(
             else nullcontext()
         ) as renderer,
         mujoco.viewer.launch_passive(model, data, key_callback=commands.put) as viewer,
-        VisualStep() if vlm else nullcontext() as visual,
+        VisualStep(automatic=soccer) if vlm else nullcontext() as visual,
     ):
         with viewer.lock():
             viewer.cam.lookat[:] = (0, 0, 0.15)
@@ -606,6 +637,7 @@ def run_viewer(
         preview_dirty = False
         last_viewport = None
         next_capture = 0.0
+        vision_frame = 0  # Keep filenames unique across R resets.
         rgb = None
         preview = None
         while viewer.is_running():
@@ -640,11 +672,13 @@ def run_viewer(
                     was_paused = paused
                     paused = handle_key(simulation, key, paused, behavior, log)
                     if key == ord("R"):
+                        if goal is not None:
+                            goal.reset()
                         next_log = data.time + LOG_PERIOD
                     if paused != was_paused or key == ord("R"):
                         next_step = started
                 if visual is not None:
-                    update_visual_step(simulation, visual, log)
+                    update_visual_step(simulation, visual, log, goal)
                 if paused:
                     next_step = started
                 else:
@@ -654,7 +688,7 @@ def run_viewer(
                         if next_step > started + 1e-9:
                             break
                         if visual is not None:
-                            update_visual_step(simulation, visual, log)
+                            update_visual_step(simulation, visual, log, goal)
                         simulation.step()
                         if log is not None and data.time + 1e-9 >= next_log:
                             record_sample(simulation, log)
@@ -663,11 +697,20 @@ def run_viewer(
                     if next_step <= started:
                         next_step = started + model.opt.timestep
                 if visual is not None:
-                    update_visual_step(simulation, visual, log)
+                    update_visual_step(simulation, visual, log, goal)
                     if not paused and visual.needs_image(float(data.time)):
-                        visual.observe(
-                            render_head_camera(simulation, renderer), float(data.time)
-                        )
+                        frame = render_head_camera(simulation, renderer)
+                        visual.observe(frame, float(data.time))
+                        if log is not None:
+                            vision_frame += 1
+                            path = log.output / "vision" / f"{vision_frame:04d}.ppm"
+                            save_snapshot(path, frame)
+                            log.write(
+                                "event",
+                                float(data.time),
+                                event="vision_observation",
+                                image=str(path.relative_to(log.output)),
+                            )
                         print("VLM: thinking; zero motion command")
                 if renderer is not None and (
                     save_requested or data.time + 1e-9 >= next_capture
